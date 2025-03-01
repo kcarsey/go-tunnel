@@ -1,29 +1,23 @@
 package main
 
 import (
-	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/base64"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v3"
+	"tunneling/common" // our new shared package
 )
 
 // Config represents the client configuration
@@ -54,23 +48,19 @@ type Config struct {
 
 	// Log level (debug, info, warning, error)
 	LogLevel string `yaml:"logLevel"`
-}
 
-// Message types for binary protocol (same as server)
-const (
-	MessageTypeAuth         byte = 1
-	MessageTypeAuthResponse byte = 2
-	MessageTypeNewConn      byte = 3
-	MessageTypeData         byte = 4
-	MessageTypeClose        byte = 5
-	MessageTypePing         byte = 6
-	MessageTypePong         byte = 7
-)
+	// Timeouts in seconds
+	ReadTimeout int `yaml:"readTimeout"`
+	IdleTimeout int `yaml:"idleTimeout"`
+	IdleTimeoutHTTP int `yaml:"idleTimeoutHTTP"`
+	HeartbeatInterval int `yaml:"heartbeatInterval"`
+	HeartbeatTimeout int `yaml:"heartbeatTimeout"`
 
-// Auth response structure for parsing server response
-type AuthResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	// Buffer sizes
+	ReadBufferSize int `yaml:"readBufferSize"`
+	WriteBufferSize int `yaml:"writeBufferSize"`
+	BufferSize int `yaml:"bufferSize"`
+	BufferSizeHTTP int `yaml:"bufferSizeHTTP"`
 }
 
 // Client represents the tunnel client
@@ -85,6 +75,7 @@ type Client struct {
 	writeMutex   sync.Mutex // Ensure write operations are serialized
 	// Buffer pool for reusing buffers
 	bufferPool sync.Pool
+	logger     *log.Logger
 }
 
 // LocalConnection represents a connection to a local service
@@ -96,11 +87,6 @@ type LocalConnection struct {
 	forwardID       string
 	lastActivity    time.Time
 	isHTTP          bool
-}
-
-// Initialize random number generator for nonce creation
-func init() {
-	rand.Seed(time.Now().UnixNano())
 }
 
 // NewClient creates a new tunnel client
@@ -117,17 +103,60 @@ func NewClient(configFile string) (*Client, error) {
 
 	// Set defaults
 	if config.MaxReconnectAttempts == 0 {
-		config.MaxReconnectAttempts = 10
+		config.MaxReconnectAttempts = common.DefaultMaxReconnectAttempts
 	}
 	if config.ReconnectDelay == 0 {
-		config.ReconnectDelay = 5
+		config.ReconnectDelay = common.DefaultReconnectDelay
 	}
-	if config.UseTLS == false {
+	
+	// Set security defaults - ensure secure by default
+	if !config.UseTLS {
 		log.Println("WARNING: TLS is disabled. This is not recommended for production use.")
+	} else {
+		// If not explicitly disabled, enable security features
+		config.UseTLS = true
 	}
-	if config.VerifyCert == false {
+	
+	if !config.VerifyCert {
 		log.Println("WARNING: TLS certificate verification is disabled. This is not recommended for production use.")
+	} else {
+		// If not explicitly disabled, enable security features 
+		config.VerifyCert = true
 	}
+
+	// Set timeout defaults
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = common.DefaultReadTimeout
+	}
+	if config.IdleTimeout == 0 {
+		config.IdleTimeout = common.DefaultIdleTimeoutGeneral
+	}
+	if config.IdleTimeoutHTTP == 0 {
+		config.IdleTimeoutHTTP = common.DefaultIdleTimeoutHTTP
+	}
+	if config.HeartbeatInterval == 0 {
+		config.HeartbeatInterval = common.DefaultHeartbeatInterval
+	}
+	if config.HeartbeatTimeout == 0 {
+		config.HeartbeatTimeout = common.DefaultHeartbeatTimeout
+	}
+
+	// Set buffer size defaults
+	if config.ReadBufferSize == 0 {
+		config.ReadBufferSize = common.DefaultReadBufferSize
+	}
+	if config.WriteBufferSize == 0 {
+		config.WriteBufferSize = common.DefaultWriteBufferSize
+	}
+	if config.BufferSize == 0 {
+		config.BufferSize = common.DefaultBufferSize
+	}
+	if config.BufferSizeHTTP == 0 {
+		config.BufferSizeHTTP = common.DefaultBufferSizeHTTP
+	}
+
+	// Create a logger with appropriate prefix
+	logger := log.New(os.Stdout, "[CLIENT] ", log.LstdFlags)
 
 	client := &Client{
 		config:      config,
@@ -135,17 +164,18 @@ func NewClient(configFile string) (*Client, error) {
 		done:        make(chan struct{}),
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 32*1024)
+				return make([]byte, config.BufferSize)
 			},
 		},
+		logger: logger,
 	}
 
 	return client, nil
 }
 
-// Start starts the tunnel client
+// Start the tunnel client
 func (c *Client) Start() error {
-	log.Printf("Starting tunnel client with ID %s", c.config.ClientID)
+	c.logger.Printf("Starting tunnel client with ID %s", c.config.ClientID)
 
 	// Set up signal handling for graceful shutdown
 	signals := make(chan os.Signal, 1)
@@ -153,7 +183,7 @@ func (c *Client) Start() error {
 
 	go func() {
 		<-signals
-		log.Println("Received shutdown signal")
+		c.logger.Println("Received shutdown signal")
 		close(c.done)
 	}()
 
@@ -168,11 +198,10 @@ func (c *Client) Start() error {
 			if err == nil {
 				// Connection successful, reset attempt counter
 				attempt = 0
-
 				// connect() handles the wait for disconnect
 				// When we return here, it's because we need to reconnect
 			} else {
-				log.Printf("Connection error: %v", err)
+				c.logger.Printf("Connection error: %v", err)
 			}
 
 			// Connection failed or disconnected
@@ -182,7 +211,7 @@ func (c *Client) Start() error {
 			}
 
 			delay := time.Duration(c.config.ReconnectDelay) * time.Second
-			log.Printf("Reconnecting in %d seconds (attempt %d/%d)...",
+			c.logger.Printf("Reconnecting in %d seconds (attempt %d/%d)...",
 				c.config.ReconnectDelay, attempt, c.config.MaxReconnectAttempts)
 
 			select {
@@ -193,88 +222,6 @@ func (c *Client) Start() error {
 			}
 		}
 	}
-}
-
-// Generate a random nonce string
-func generateNonce(length int) string {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, length)
-	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
-	}
-	return string(b)
-}
-
-// createAuthMessage creates an authentication message with HMAC
-func (c *Client) createAuthMessage() []byte {
-	clientID := c.config.ClientID
-	timestamp := time.Now().Unix()
-	nonce := generateNonce(16)
-
-	// Create the message to sign
-	message := fmt.Sprintf("%s:%d:%s", clientID, timestamp, nonce)
-
-	// Create HMAC
-	h := hmac.New(sha256.New, []byte(c.config.AccessKey))
-	h.Write([]byte(message))
-	hmacDigest := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	// Format binary auth message
-	// [type][client ID len][client ID][timestamp][nonce len][nonce][hmac len][hmac]
-	clientIDBytes := []byte(clientID)
-	nonceBytes := []byte(nonce)
-	hmacBytes := []byte(hmacDigest)
-
-	buf := bytes.NewBuffer(make([]byte, 0, 1+4+len(clientIDBytes)+4+4+len(nonceBytes)+4+len(hmacBytes)))
-
-	buf.WriteByte(MessageTypeAuth)
-	binary.Write(buf, binary.BigEndian, uint32(len(clientIDBytes)))
-	buf.Write(clientIDBytes)
-	binary.Write(buf, binary.BigEndian, uint32(timestamp))
-	binary.Write(buf, binary.BigEndian, uint32(len(nonceBytes)))
-	buf.Write(nonceBytes)
-	binary.Write(buf, binary.BigEndian, uint32(len(hmacBytes)))
-	buf.Write(hmacBytes)
-
-	return buf.Bytes()
-}
-
-// parseAuthResponse parses the authentication response
-func parseAuthResponse(data []byte) (AuthResponse, error) {
-	var resp AuthResponse
-
-	if len(data) < 2 {
-		return resp, fmt.Errorf("auth response too short")
-	}
-
-	// First byte is message type, should be AuthResponse
-	if data[0] != MessageTypeAuthResponse {
-		return resp, fmt.Errorf("unexpected message type: %d", data[0])
-	}
-
-	// Second byte is success flag
-	resp.Success = data[1] == 1
-
-	// Rest is message
-	if len(data) > 2 {
-		buf := bytes.NewBuffer(data[2:])
-
-		var msgLen uint32
-		err := binary.Read(buf, binary.BigEndian, &msgLen)
-		if err != nil {
-			return resp, fmt.Errorf("error reading message length: %w", err)
-		}
-
-		msgBytes := make([]byte, msgLen)
-		_, err = buf.Read(msgBytes)
-		if err != nil {
-			return resp, fmt.Errorf("error reading message: %w", err)
-		}
-
-		resp.Message = string(msgBytes)
-	}
-
-	return resp, nil
 }
 
 // connect establishes a connection to the server
@@ -307,7 +254,7 @@ func (c *Client) connect() error {
 		Path:   "/ws",
 	}
 
-	log.Printf("Connecting to %s", u.String())
+	c.logger.Printf("Connecting to %s", u.String())
 
 	// Set up dialer with improved configuration
 	var dialer *websocket.Dialer
@@ -333,15 +280,15 @@ func (c *Client) connect() error {
 
 		dialer = &websocket.Dialer{
 			TLSClientConfig:  tlsConfig,
-			ReadBufferSize:   32768,
-			WriteBufferSize:  32768,
-			HandshakeTimeout: 45 * time.Second,
+			ReadBufferSize:   c.config.ReadBufferSize,
+			WriteBufferSize:  c.config.WriteBufferSize,
+			HandshakeTimeout: time.Duration(common.DefaultHandshakeTimeout) * time.Second,
 		}
 	} else {
 		dialer = &websocket.Dialer{
-			ReadBufferSize:   32768,
-			WriteBufferSize:  32768,
-			HandshakeTimeout: 45 * time.Second,
+			ReadBufferSize:   c.config.ReadBufferSize,
+			WriteBufferSize:  c.config.WriteBufferSize,
+			HandshakeTimeout: time.Duration(common.DefaultHandshakeTimeout) * time.Second,
 		}
 	}
 
@@ -349,16 +296,17 @@ func (c *Client) connect() error {
 	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
 		if resp != nil {
-			log.Printf("Server returned HTTP %d: %s", resp.StatusCode, resp.Status)
+			c.logger.Printf("Server returned HTTP %d: %s", resp.StatusCode, resp.Status)
 		}
 		return fmt.Errorf("error connecting to server: %w", err)
 	}
 
 	// Enable keep-alive with pong handler
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	readTimeout := time.Duration(c.config.ReadTimeout) * time.Second
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPongHandler(func(string) error {
-		log.Printf("Received pong from server")
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		c.logger.Printf("Received pong from server")
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
 		return nil
 	})
 
@@ -366,8 +314,8 @@ func (c *Client) connect() error {
 	c.lastActivity = time.Now()
 
 	// Authenticate using HMAC
-	log.Printf("Connected to server, sending authentication")
-	authMsg := c.createAuthMessage()
+	c.logger.Printf("Connected to server, sending authentication")
+	authMsg := common.CreateAuthMessage(c.config.ClientID, c.config.AccessKey)
 
 	c.writeMutex.Lock()
 	if err := conn.WriteMessage(websocket.BinaryMessage, authMsg); err != nil {
@@ -378,14 +326,14 @@ func (c *Client) connect() error {
 	c.writeMutex.Unlock()
 
 	// Wait for auth response
-	log.Printf("Authentication sent, waiting for response")
+	c.logger.Printf("Authentication sent, waiting for response")
 	_, respBytes, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("error reading auth response: %w", err)
 	}
 
-	authResp, err := parseAuthResponse(respBytes)
+	authResp, err := common.ParseAuthResponse(respBytes)
 	if err != nil {
 		conn.Close()
 		return fmt.Errorf("error parsing auth response: %w", err)
@@ -394,47 +342,7 @@ func (c *Client) connect() error {
 	if !authResp.Success {
 		conn.Close()
 		return fmt.Errorf("authentication failed: %s", authResp.Message)
-	}
-
-	log.Printf("Connected and authenticated successfully, waiting for server messages")
-
-	// Use a WaitGroup and done channel to coordinate goroutine shutdown
-	clientDone := make(chan struct{})
-	var wg sync.WaitGroup
-
-	// Start message handling
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		c.handleMessages(clientDone)
-	}()
-
-	// Start heartbeat
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		c.startHeartbeat(clientDone)
-	}()
-
-	// Wait for disconnection or done signal
-	select {
-	case <-c.done:
-		log.Printf("Client shutting down due to external signal")
-		close(clientDone)
-		conn.WriteMessage(websocket.CloseMessage,
-			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client shutting down"))
-		conn.Close()
-	case <-clientDone:
-		log.Printf("Client disconnected due to WebSocket closure")
-	}
-
-	wg.Wait()
-	log.Printf("Client connection fully cleaned up")
-
-	return nil // Return nil to allow reconnection
-}
-
-// handleMessages handles incoming messages from the server
+		// handleMessages handles incoming messages from the server
 func (c *Client) handleMessages(done chan struct{}) {
 	defer func() {
 		if !c.reconnecting {
@@ -447,7 +355,7 @@ func (c *Client) handleMessages(done chan struct{}) {
 			}
 			c.connMutex.Unlock()
 
-			log.Printf("Client message handler exited")
+			c.logger.Printf("Client message handler exited")
 			close(done)
 		}
 	}()
@@ -456,7 +364,7 @@ func (c *Client) handleMessages(done chan struct{}) {
 		// Read message using binary protocol
 		msgType, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading message from server: %v", err)
+			c.logger.Printf("Error reading message from server: %v", err)
 			return
 		}
 
@@ -464,254 +372,269 @@ func (c *Client) handleMessages(done chan struct{}) {
 
 		// Handle control messages (ping, pong, close)
 		if msgType == websocket.PingMessage {
-			log.Printf("Received ping from server, responding with pong")
+			c.logger.Printf("Received ping from server, responding with pong")
 			c.writeMutex.Lock()
 			c.conn.WriteMessage(websocket.PongMessage, nil)
 			c.writeMutex.Unlock()
 			continue
 		} else if msgType == websocket.PongMessage {
-			log.Printf("Received WebSocket pong from server")
+			c.logger.Printf("Received WebSocket pong from server")
 			continue
 		} else if msgType == websocket.CloseMessage {
-			log.Printf("Received close frame from server")
+			c.logger.Printf("Received close frame from server")
 			return
 		} else if msgType != websocket.BinaryMessage {
-			log.Printf("Received unexpected WebSocket message type: %d", msgType)
+			c.logger.Printf("Received unexpected WebSocket message type: %d", msgType)
 			continue
 		}
 
 		if len(msgBytes) == 0 {
-			log.Printf("Received empty message from server")
+			c.logger.Printf("Received empty message from server")
 			continue
 		}
 
 		// Handle based on message type
-		msgType = int(msgBytes[0])
+		messageType := msgBytes[0]
 		payload := msgBytes[1:]
 
-		switch msgBytes[0] {
-		case MessageTypeNewConn:
-			log.Printf("Received new connection request")
-			// Parse new connection message
-			// Format: [conn ID len][conn ID][forward ID len][forward ID][dest addr len][dest addr]
-			buf := bytes.NewBuffer(payload)
-
-			var connIDLen uint32
-			err := binary.Read(buf, binary.BigEndian, &connIDLen)
-			if err != nil {
-				log.Printf("Error reading conn ID length: %v", err)
-				continue
-			}
-
-			connIDBytes := make([]byte, connIDLen)
-			_, err = buf.Read(connIDBytes)
-			if err != nil {
-				log.Printf("Error reading conn ID: %v", err)
-				continue
-			}
-			connID := string(connIDBytes)
-
-			var forwardIDLen uint32
-			err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
-			if err != nil {
-				log.Printf("Error reading forward ID length: %v", err)
-				continue
-			}
-
-			forwardIDBytes := make([]byte, forwardIDLen)
-			_, err = buf.Read(forwardIDBytes)
-			if err != nil {
-				log.Printf("Error reading forward ID: %v", err)
-				continue
-			}
-			forwardID := string(forwardIDBytes)
-
-			var destAddrLen uint32
-			err = binary.Read(buf, binary.BigEndian, &destAddrLen)
-			if err != nil {
-				log.Printf("Error reading destination address length: %v", err)
-				continue
-			}
-
-			destAddrBytes := make([]byte, destAddrLen)
-			_, err = buf.Read(destAddrBytes)
-			if err != nil {
-				log.Printf("Error reading destination address: %v", err)
-				continue
-			}
-			destAddr := string(destAddrBytes)
-
-			log.Printf("New connection request: %s, forwarding to %s", connID, destAddr)
-
-			// Handle the new connection
-			go c.handleNewConnection(connID, forwardID, destAddr)
-
-		case MessageTypeData:
-			// Parse data message
-			// Format: [conn ID len][conn ID][forward ID len][forward ID][data len][data]
-			buf := bytes.NewBuffer(payload)
-
-			var connIDLen uint32
-			err := binary.Read(buf, binary.BigEndian, &connIDLen)
-			if err != nil {
-				log.Printf("Error reading conn ID length: %v", err)
-				continue
-			}
-
-			connIDBytes := make([]byte, connIDLen)
-			_, err = buf.Read(connIDBytes)
-			if err != nil {
-				log.Printf("Error reading conn ID: %v", err)
-				continue
-			}
-			connID := string(connIDBytes)
-
-			var forwardIDLen uint32
-			err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
-			if err != nil {
-				log.Printf("Error reading forward ID length: %v", err)
-				continue
-			}
-
-			forwardIDBytes := make([]byte, forwardIDLen)
-			_, err = buf.Read(forwardIDBytes)
-			if err != nil {
-				log.Printf("Error reading forward ID: %v", err)
-				continue
-			}
-
-			var dataLen uint32
-			err = binary.Read(buf, binary.BigEndian, &dataLen)
-			if err != nil {
-				log.Printf("Error reading data length: %v", err)
-				continue
-			}
-
-			data := make([]byte, dataLen)
-			_, err = buf.Read(data)
-			if err != nil {
-				log.Printf("Error reading data: %v", err)
-				continue
-			}
-
-			// Find local connection with race condition handling
-			c.connMutex.RLock()
-			localConn, exists := c.connections[connID]
-			c.connMutex.RUnlock()
-
-			if !exists {
-				// Check if this is a race condition with a connection that's being established
-				// Add a small delay before closing to give handleNewConnection time to establish
-				log.Printf("Local connection %s not found, waiting briefly before closing", connID)
-
-				// Wait a short time (50ms) to see if connection gets established
-				time.Sleep(50 * time.Millisecond)
-
-				// Check again
-				c.connMutex.RLock()
-				localConn, exists = c.connections[connID]
-				c.connMutex.RUnlock()
-
-				if !exists {
-					log.Printf("Local connection %s still not found after delay, closing", connID)
-					c.sendCloseMessage(connID, string(forwardIDBytes))
-					continue
-				} else {
-					log.Printf("Local connection %s found after delay, continuing", connID)
-				}
-			}
-
-			// Write data to local connection
-			_, err = localConn.conn.Write(data)
-			if err != nil {
-				log.Printf("Error writing to local connection %s: %v", connID, err)
-				localConn.conn.Close()
-
-				c.connMutex.Lock()
-				delete(c.connections, connID)
-				c.connMutex.Unlock()
-
-				c.sendCloseMessage(connID, string(forwardIDBytes))
-			}
-
-		case MessageTypeClose:
-			// Parse close message
-			// Format: [conn ID len][conn ID][forward ID len][forward ID]
-			buf := bytes.NewBuffer(payload)
-
-			var connIDLen uint32
-			err := binary.Read(buf, binary.BigEndian, &connIDLen)
-			if err != nil {
-				log.Printf("Error reading conn ID length: %v", err)
-				continue
-			}
-
-			connIDBytes := make([]byte, connIDLen)
-			_, err = buf.Read(connIDBytes)
-			if err != nil {
-				log.Printf("Error reading conn ID: %v", err)
-				continue
-			}
-			connID := string(connIDBytes)
-
-			log.Printf("Received close for connection %s", connID)
-
-			// Find and close local connection
-			c.connMutex.RLock()
-			localConn, exists := c.connections[connID]
-			c.connMutex.RUnlock()
-
-			if exists {
-				localConn.conn.Close()
-
-				c.connMutex.Lock()
-				delete(c.connections, connID)
-				c.connMutex.Unlock()
-
-				log.Printf("Closed local connection %s", connID)
-			}
-
-		case MessageTypePing:
-			log.Printf("Received ping from server")
-			// Respond with pong (simple binary message)
-			pongMsg := []byte{MessageTypePong}
-			c.writeMutex.Lock()
-			err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
-			c.writeMutex.Unlock()
-
-			if err != nil {
-				log.Printf("Error sending pong to server: %v", err)
-			}
-
-		case MessageTypePong:
-			log.Printf("Received application-level pong from server")
-			// Just update last activity time
-			// Already done at the start of the message handler
+		switch messageType {
+		case common.MessageTypeNewConn:
+			c.handleNewConnMessage(payload)
+		case common.MessageTypeData:
+			c.handleDataMessage(payload)
+		case common.MessageTypeClose:
+			c.handleCloseMessage(payload)
+		case common.MessageTypePing:
+			c.handlePingMessage()
+		case common.MessageTypePong:
+			c.logger.Printf("Received application-level pong from server")
+		default:
+			c.logger.Printf("Received unknown message type: %d", messageType)
 		}
+	}
+}
+
+// handleNewConnMessage processes a new connection message from the server
+func (c *Client) handleNewConnMessage(payload []byte) {
+	c.logger.Printf("Received new connection request")
+	// Parse new connection message
+	// Format: [conn ID len][conn ID][forward ID len][forward ID][dest addr len][dest addr]
+	buf := bytes.NewBuffer(payload)
+
+	var connIDLen uint32
+	err := binary.Read(buf, binary.BigEndian, &connIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID length: %v", err)
+		return
+	}
+
+	connIDBytes := make([]byte, connIDLen)
+	_, err = buf.Read(connIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID: %v", err)
+		return
+	}
+	connID := string(connIDBytes)
+
+	var forwardIDLen uint32
+	err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID length: %v", err)
+		return
+	}
+
+	forwardIDBytes := make([]byte, forwardIDLen)
+	_, err = buf.Read(forwardIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID: %v", err)
+		return
+	}
+	forwardID := string(forwardIDBytes)
+
+	var destAddrLen uint32
+	err = binary.Read(buf, binary.BigEndian, &destAddrLen)
+	if err != nil {
+		c.logger.Printf("Error reading destination address length: %v", err)
+		return
+	}
+
+	destAddrBytes := make([]byte, destAddrLen)
+	_, err = buf.Read(destAddrBytes)
+	if err != nil {
+		c.logger.Printf("Error reading destination address: %v", err)
+		return
+	}
+	destAddr := string(destAddrBytes)
+
+	c.logger.Printf("New connection request: %s, forwarding to %s", connID, destAddr)
+
+	// Handle the new connection
+	go c.handleNewConnection(connID, forwardID, destAddr)
+}
+
+// handleDataMessage processes a data message from the server
+func (c *Client) handleDataMessage(payload []byte) {
+	// Parse data message
+	// Format: [conn ID len][conn ID][forward ID len][forward ID][data len][data]
+	buf := bytes.NewBuffer(payload)
+
+	var connIDLen uint32
+	err := binary.Read(buf, binary.BigEndian, &connIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID length: %v", err)
+		return
+	}
+
+	connIDBytes := make([]byte, connIDLen)
+	_, err = buf.Read(connIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID: %v", err)
+		return
+	}
+	connID := string(connIDBytes)
+
+	var forwardIDLen uint32
+	err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID length: %v", err)
+		return
+	}
+
+	forwardIDBytes := make([]byte, forwardIDLen)
+	_, err = buf.Read(forwardIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID: %v", err)
+		return
+	}
+	forwardID := string(forwardIDBytes)
+
+	var dataLen uint32
+	err = binary.Read(buf, binary.BigEndian, &dataLen)
+	if err != nil {
+		c.logger.Printf("Error reading data length: %v", err)
+		return
+	}
+
+	data := make([]byte, dataLen)
+	_, err = buf.Read(data)
+	if err != nil {
+		c.logger.Printf("Error reading data: %v", err)
+		return
+	}
+
+	// Find local connection with race condition handling
+	c.connMutex.RLock()
+	localConn, exists := c.connections[connID]
+	c.connMutex.RUnlock()
+
+	if !exists {
+		// Check if this is a race condition with a connection that's being established
+		// Add a small delay before closing to give handleNewConnection time to establish
+		c.logger.Printf("Local connection %s not found, waiting briefly before closing", connID)
+
+		// Wait a short time to see if connection gets established
+		time.Sleep(time.Duration(common.RaceConditionDelay) * time.Millisecond)
+
+		// Check again
+		c.connMutex.RLock()
+		localConn, exists = c.connections[connID]
+		c.connMutex.RUnlock()
+
+		if !exists {
+			c.logger.Printf("Local connection %s still not found after delay, closing", connID)
+			c.sendCloseMessage(connID, forwardID)
+			return
+		} else {
+			c.logger.Printf("Local connection %s found after delay, continuing", connID)
+		}
+	}
+
+	// Write data to local connection
+	_, err = localConn.conn.Write(data)
+	if err != nil {
+		c.logger.Printf("Error writing to local connection %s: %v", connID, err)
+		localConn.conn.Close()
+
+		c.connMutex.Lock()
+		delete(c.connections, connID)
+		c.connMutex.Unlock()
+
+		c.sendCloseMessage(connID, forwardID)
+	}
+}
+
+// handleCloseMessage processes a close message from the server
+func (c *Client) handleCloseMessage(payload []byte) {
+	// Parse close message
+	// Format: [conn ID len][conn ID][forward ID len][forward ID]
+	buf := bytes.NewBuffer(payload)
+
+	var connIDLen uint32
+	err := binary.Read(buf, binary.BigEndian, &connIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID length: %v", err)
+		return
+	}
+
+	connIDBytes := make([]byte, connIDLen)
+	_, err = buf.Read(connIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID: %v", err)
+		return
+	}
+	connID := string(connIDBytes)
+
+	c.logger.Printf("Received close for connection %s", connID)
+
+	// Find and close local connection
+	c.connMutex.RLock()
+	localConn, exists := c.connections[connID]
+	c.connMutex.RUnlock()
+
+	if exists {
+		localConn.conn.Close()
+
+		c.connMutex.Lock()
+		delete(c.connections, connID)
+		c.connMutex.Unlock()
+
+		c.logger.Printf("Closed local connection %s", connID)
+	}
+}
+
+// handlePingMessage processes a ping message from the server
+func (c *Client) handlePingMessage() {
+	c.logger.Printf("Received ping from server")
+	// Respond with pong
+	pongMsg := common.CreatePongMessage()
+	c.writeMutex.Lock()
+	err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
+	c.writeMutex.Unlock()
+
+	if err != nil {
+		c.logger.Printf("Error sending pong to server: %v", err)
 	}
 }
 
 // handleNewConnection handles a new connection request from the server
 func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
-	log.Printf("New connection request: %s to %s", connID, destAddr)
+	c.logger.Printf("New connection request: %s to %s", connID, destAddr)
 
-	// Detect if this is likely HTTP traffic based on the destination port
-	isHTTP := false
-	if strings.HasSuffix(destAddr, ":80") || strings.HasSuffix(destAddr, ":443") ||
-		strings.HasSuffix(destAddr, ":8080") || strings.HasSuffix(destAddr, ":8123") {
-		isHTTP = true
-		log.Printf("HTTP traffic detected for connection %s", connID)
+	// Detect if this is likely HTTP traffic
+	isHTTP := common.IsHTTPTraffic(destAddr)
+	if isHTTP {
+		c.logger.Printf("HTTP traffic detected for connection %s", connID)
 	}
 
 	// Connect to local service
 	localConn, err := net.Dial("tcp", destAddr)
 	if err != nil {
-		log.Printf("Error connecting to local service %s: %v", destAddr, err)
+		c.logger.Printf("Error connecting to local service %s: %v", destAddr, err)
 		c.sendCloseMessage(connID, forwardID)
 		return
 	}
 
-	log.Printf("Connected to local service %s for connection %s", destAddr, connID)
+	c.logger.Printf("Connected to local service %s for connection %s", destAddr, connID)
 
 	// Create local connection
 	conn := &LocalConnection{
@@ -735,8 +658,8 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 
 	// If HTTP, use larger buffer and longer idle timeout
 	if isHTTP {
-		buffer = make([]byte, 64*1024) // Larger buffer for HTTP
-		idleTimeout = 15 * time.Second
+		buffer = make([]byte, c.config.BufferSizeHTTP) // Larger buffer for HTTP
+		idleTimeout = time.Duration(c.config.IdleTimeoutHTTP) * time.Second
 	} else {
 		buffer = c.bufferPool.Get().([]byte)
 		defer func() {
@@ -745,7 +668,7 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 				c.bufferPool.Put(buffer)
 			}
 		}()
-		idleTimeout = 5 * time.Second
+		idleTimeout = time.Duration(c.config.IdleTimeout) * time.Second
 	}
 
 	// Set initial read deadline
@@ -758,16 +681,16 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Just a timeout, reset deadline and continue for HTTP connections
 				if isHTTP {
-					log.Printf("HTTP connection %s idle, extending timeout", connID)
+					c.logger.Printf("HTTP connection %s idle, extending timeout", connID)
 					localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 					continue
 				}
 			}
 
 			if err != io.EOF {
-				log.Printf("Error reading from local connection %s: %v", connID, err)
+				c.logger.Printf("Error reading from local connection %s: %v", connID, err)
 			} else {
-				log.Printf("Local connection %s closed by local service", connID)
+				c.logger.Printf("Local connection %s closed by local service", connID)
 			}
 			break
 		}
@@ -777,28 +700,15 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 
 		conn.lastActivity = time.Now()
 
-		// Send data to server using binary protocol
-		// Format: [type][conn ID len][conn ID][forward ID len][forward ID][data len][data]
-		connIDBytes := []byte(connID)
-		forwardIDBytes := []byte(forwardID)
-
-		dataSize := 1 + 4 + len(connIDBytes) + 4 + len(forwardIDBytes) + 4 + n
-		dataBuf := bytes.NewBuffer(make([]byte, 0, dataSize))
-
-		dataBuf.WriteByte(MessageTypeData)
-		binary.Write(dataBuf, binary.BigEndian, uint32(len(connIDBytes)))
-		dataBuf.Write(connIDBytes)
-		binary.Write(dataBuf, binary.BigEndian, uint32(len(forwardIDBytes)))
-		dataBuf.Write(forwardIDBytes)
-		binary.Write(dataBuf, binary.BigEndian, uint32(n))
-		dataBuf.Write(buffer[:n])
-
+		// Send data to server
+		dataMsg := common.CreateDataMessage(connID, forwardID, buffer[:n])
+		
 		c.writeMutex.Lock()
-		err = c.conn.WriteMessage(websocket.BinaryMessage, dataBuf.Bytes())
+		err = c.conn.WriteMessage(websocket.BinaryMessage, dataMsg)
 		c.writeMutex.Unlock()
 
 		if err != nil {
-			log.Printf("Error sending data to server: %v", err)
+			c.logger.Printf("Error sending data to server: %v", err)
 			break
 		}
 	}
@@ -809,12 +719,12 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 	delete(c.connections, connID)
 	c.connMutex.Unlock()
 
-	log.Printf("Local connection %s closed and cleaned up", connID)
+	c.logger.Printf("Local connection %s closed and cleaned up", connID)
 
 	// For HTTP connections, delay the close message to allow time for any in-flight data
 	if isHTTP {
-		log.Printf("HTTP connection %s - delaying close message by 100ms", connID)
-		time.Sleep(100 * time.Millisecond)
+		c.logger.Printf("HTTP connection %s - delaying close message by 100ms", connID)
+		time.Sleep(time.Duration(common.HTTPCloseDelay) * time.Millisecond)
 	}
 
 	// Notify server that connection is closed
@@ -823,35 +733,25 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 
 // sendCloseMessage sends a close message to the server
 func (c *Client) sendCloseMessage(connID, forwardID string) {
-	log.Printf("Sending close message for connection %s", connID)
+	c.logger.Printf("Sending close message for connection %s", connID)
 
-	// Format: [type][conn ID len][conn ID][forward ID len][forward ID]
-	connIDBytes := []byte(connID)
-	forwardIDBytes := []byte(forwardID)
-
-	buf := bytes.NewBuffer(make([]byte, 0, 1+4+len(connIDBytes)+4+len(forwardIDBytes)))
-
-	buf.WriteByte(MessageTypeClose)
-	binary.Write(buf, binary.BigEndian, uint32(len(connIDBytes)))
-	buf.Write(connIDBytes)
-	binary.Write(buf, binary.BigEndian, uint32(len(forwardIDBytes)))
-	buf.Write(forwardIDBytes)
+	closeMsg := common.CreateCloseMessage(connID, forwardID)
 
 	c.writeMutex.Lock()
-	err := c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	err := c.conn.WriteMessage(websocket.BinaryMessage, closeMsg)
 	c.writeMutex.Unlock()
 
 	if err != nil {
-		log.Printf("Error sending close message to server: %v", err)
+		c.logger.Printf("Error sending close message to server: %v", err)
 	}
 }
 
 // startHeartbeat starts a heartbeat goroutine for the client
 func (c *Client) startHeartbeat(done chan struct{}) {
-	ticker := time.NewTicker(15 * time.Second) // More frequent heartbeats
+	ticker := time.NewTicker(time.Duration(c.config.HeartbeatInterval) * time.Second)
 	defer ticker.Stop()
 
-	log.Printf("Started heartbeat")
+	c.logger.Printf("Started heartbeat")
 
 	for {
 		select {
@@ -859,35 +759,35 @@ func (c *Client) startHeartbeat(done chan struct{}) {
 			// Check if client is done
 			select {
 			case <-c.done:
-				log.Printf("Heartbeat stopped due to client shutdown")
+				c.logger.Printf("Heartbeat stopped due to client shutdown")
 				return
 			default:
 				// Continue
 			}
 
 			// Check if client is still active
-			if time.Since(c.lastActivity) > 45*time.Second {
-				log.Printf("Server timed out (no activity for >45s)")
+			if time.Since(c.lastActivity) > time.Duration(c.config.HeartbeatTimeout)*time.Second {
+				c.logger.Printf("Server timed out (no activity for >%ds)", c.config.HeartbeatTimeout)
 				c.conn.Close()
 				return
 			}
 
 			// Send ping using binary protocol
-			log.Printf("Sending ping to server")
-			pingMsg := []byte{MessageTypePing}
+			c.logger.Printf("Sending ping to server")
+			pingMsg := common.CreatePingMessage()
 
 			c.writeMutex.Lock()
 			err := c.conn.WriteMessage(websocket.BinaryMessage, pingMsg)
 			c.writeMutex.Unlock()
 
 			if err != nil {
-				log.Printf("Error sending ping to server: %v", err)
+				c.logger.Printf("Error sending ping to server: %v", err)
 				c.conn.Close()
 				return
 			}
 
 		case <-done:
-			log.Printf("Heartbeat stopped due to WebSocket closure")
+			c.logger.Printf("Heartbeat stopped due to WebSocket closure")
 			return
 		}
 	}

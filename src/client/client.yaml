@@ -7,14 +7,29 @@ serverAddress: "1.2.3.4:8443"
 # Access key for authentication
 accessKey: "secret-key-1"
 
-# TLS configuration
-# useTLS: true
-# verifyCert: true
+# TLS configuration (defaults to true for both)
+useTLS: true
+verifyCert: true
 
 # Optional CA certificate file for custom CA trust
 # caFile: "/path/to/ca.pem"
 
-logLevel: "debug"  # Increase logging detail
-# Ensure reconnect settings are appropriate
+# Log level (debug, info, warning, error)
+logLevel: "debug"
+
+# Reconnect settings
 maxReconnectAttempts: 15
-reconnectDelay: 3  # Try more frequent reconnects
+reconnectDelay: 3  # seconds
+
+# Timeouts (in seconds)
+readTimeout: 60       # WebSocket read timeout
+idleTimeout: 5        # General connection idle timeout
+idleTimeoutHTTP: 15   # HTTP connection idle timeout
+heartbeatInterval: 15 # How often to send heartbeats
+heartbeatTimeout: 45  # How long to wait before considering connection dead
+
+# Buffer sizes (in bytes)
+readBufferSize: 32768
+writeBufferSize: 32768
+bufferSize: 32768
+bufferSizeHTTP: 65536

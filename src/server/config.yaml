@@ -1,7 +1,7 @@
 # Server control address to listen on
 controlAddress: "0.0.0.0:8443"
 
-# TLS configuration (comment out for development without TLS)
+# TLS configuration
 certFile: "/path/to/cert.pem"
 keyFile: "/path/to/key.pem"
 
@@ -11,7 +11,7 @@ authorizedKeys:
   app-server: "secret-key-2"
   db-server: "secret-key-3"
 
-# Authentication timeout in seconds (default: 300 = 5 minutes)
+# Authentication timeout in seconds
 authTimeout: 300
 
 # Forwarding configuration
@@ -20,18 +20,39 @@ forwards:
     listenAddress: "0.0.0.0:2222"
     targetClient: "web-server"
     destinationAddress: "192.168.1.5:22"
+    # Specify traffic type (http, tcp)
+    trafficType: "tcp"
   
   # - name: "http"
   #   listenAddress: "0.0.0.0:8080"
   #   targetClient: "web-server"
   #   destinationAddress: "127.0.0.1:80"
+  #   trafficType: "http"
   
   # - name: "https"
   #   listenAddress: "0.0.0.0:8443"
   #   targetClient: "web-server"
   #   destinationAddress: "127.0.0.1:443"
+  #   trafficType: "http"
     
   # - name: "mysql"
   #   listenAddress: "0.0.0.0:3306"
   #   targetClient: "db-server"
   #   destinationAddress: "127.0.0.1:3306"
+  #   trafficType: "tcp"
+
+# Timeouts (in seconds)
+readTimeout: 60       # WebSocket read timeout
+idleTimeout: 5        # General connection idle timeout
+idleTimeoutHTTP: 30   # HTTP connection idle timeout
+heartbeatInterval: 15 # How often to send heartbeats
+heartbeatTimeout: 45  # How long to wait before considering connection dead
+
+# Buffer sizes (in bytes)
+readBufferSize: 32768
+writeBufferSize: 32768
+bufferSize: 32768
+bufferSizeHTTP: 65536
+
+# Log level (debug, info, warning, error)
+logLevel: "info"

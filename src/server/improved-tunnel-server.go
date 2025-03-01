@@ -2,9 +2,6 @@ package main
 
 import (
 	"bytes"
-	"crypto/hmac"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -19,6 +16,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v3"
+	"tunneling/common" // our new shared package
 )
 
 // Config represents the server configuration
@@ -43,6 +41,19 @@ type Config struct {
 
 	// Log level (debug, info, warning, error)
 	LogLevel string `yaml:"logLevel"`
+
+	// Timeouts in seconds
+	ReadTimeout int `yaml:"readTimeout"`
+	IdleTimeout int `yaml:"idleTimeout"`
+	IdleTimeoutHTTP int `yaml:"idleTimeoutHTTP"`
+	HeartbeatInterval int `yaml:"heartbeatInterval"`
+	HeartbeatTimeout int `yaml:"heartbeatTimeout"`
+
+	// Buffer sizes
+	ReadBufferSize int `yaml:"readBufferSize"`
+	WriteBufferSize int `yaml:"writeBufferSize"`
+	BufferSize int `yaml:"bufferSize"`
+	BufferSizeHTTP int `yaml:"bufferSizeHTTP"`
 }
 
 // ForwardConfig represents a port forwarding configuration
@@ -63,30 +74,6 @@ type ForwardConfig struct {
 	TrafficType string `yaml:"trafficType,omitempty"`
 }
 
-// Message types for binary protocol
-const (
-	MessageTypeAuth         byte = 1
-	MessageTypeAuthResponse byte = 2
-	MessageTypeNewConn      byte = 3
-	MessageTypeData         byte = 4
-	MessageTypeClose        byte = 5
-	MessageTypePing         byte = 6
-	MessageTypePong         byte = 7
-)
-
-// Auth request/response structure for JSON interchange
-type AuthRequest struct {
-	ClientID   string `json:"client_id"`
-	Timestamp  int64  `json:"timestamp"`
-	Nonce      string `json:"nonce"`
-	HMACDigest string `json:"hmac"`
-}
-
-type AuthResponse struct {
-	Success bool   `json:"success"`
-	Message string `json:"message"`
-}
-
 // Server represents the tunnel server
 type Server struct {
 	config        Config
@@ -97,6 +84,9 @@ type Server struct {
 	upgrader      websocket.Upgrader
 	// Buffer pool for reusing buffers
 	bufferPool sync.Pool
+	// Nonce cache for replay protection
+	nonceCache    *common.NonceCache
+	logger        *log.Logger
 }
 
 // Client represents a connected client
@@ -109,6 +99,7 @@ type Client struct {
 	lastActivity time.Time
 	isActive     bool
 	writeMutex   sync.Mutex // Ensure write operations are serialized
+	logger       *log.Logger
 }
 
 // Forward represents a forwarding listener
@@ -119,6 +110,7 @@ type Forward struct {
 	connCount  int
 	countMutex sync.Mutex
 	isHTTP     bool
+	logger     *log.Logger
 }
 
 // ForwardedConn represents a forwarded connection
@@ -146,8 +138,45 @@ func NewServer(configFile string) (*Server, error) {
 
 	// Set defaults
 	if config.AuthTimeout == 0 {
-		config.AuthTimeout = 300 // 5 minutes by default
+		config.AuthTimeout = common.DefaultAuthTimeout
 	}
+	
+	// Set timeout defaults
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = common.DefaultReadTimeout
+	}
+	if config.IdleTimeout == 0 {
+		config.IdleTimeout = common.DefaultIdleTimeoutGeneral
+	}
+	if config.IdleTimeoutHTTP == 0 {
+		config.IdleTimeoutHTTP = common.DefaultIdleTimeoutHTTP
+	}
+	if config.HeartbeatInterval == 0 {
+		config.HeartbeatInterval = common.DefaultHeartbeatInterval
+	}
+	if config.HeartbeatTimeout == 0 {
+		config.HeartbeatTimeout = common.DefaultHeartbeatTimeout
+	}
+
+	// Set buffer size defaults
+	if config.ReadBufferSize == 0 {
+		config.ReadBufferSize = common.DefaultReadBufferSize
+	}
+	if config.WriteBufferSize == 0 {
+		config.WriteBufferSize = common.DefaultWriteBufferSize
+	}
+	if config.BufferSize == 0 {
+		config.BufferSize = common.DefaultBufferSize
+	}
+	if config.BufferSizeHTTP == 0 {
+		config.BufferSizeHTTP = common.DefaultBufferSizeHTTP
+	}
+
+	// Create a logger with appropriate prefix
+	logger := log.New(os.Stdout, "[SERVER] ", log.LstdFlags)
+
+	// Create nonce cache with expiry equal to auth timeout
+	nonceCache := common.NewNonceCache(time.Duration(config.AuthTimeout) * time.Second)
 
 	server := &Server{
 		config:   config,
@@ -157,18 +186,20 @@ func NewServer(configFile string) (*Server, error) {
 			CheckOrigin: func(r *http.Request) bool {
 				return true // Allow all connections, we'll authenticate later
 			},
-			ReadBufferSize:  32768,
-			WriteBufferSize: 32768,
+			ReadBufferSize:  config.ReadBufferSize,
+			WriteBufferSize: config.WriteBufferSize,
 			// Add error handling for handshake
 			Error: func(w http.ResponseWriter, r *http.Request, status int, reason error) {
-				log.Printf("WebSocket upgrade error: %v, status: %d", reason, status)
+				logger.Printf("WebSocket upgrade error: %v, status: %d", reason, status)
 			},
 		},
 		bufferPool: sync.Pool{
 			New: func() interface{} {
-				return make([]byte, 32*1024)
+				return make([]byte, config.BufferSize)
 			},
 		},
+		nonceCache: nonceCache,
+		logger:     logger,
 	}
 
 	return server, nil
@@ -189,12 +220,12 @@ func (s *Server) Start() error {
 
 	// Start the control server with TLS if certificates are provided
 	if s.config.CertFile != "" && s.config.KeyFile != "" {
-		log.Printf("Starting control server with TLS on %s", s.config.ControlAddress)
+		s.logger.Printf("Starting control server with TLS on %s", s.config.ControlAddress)
 		return http.ListenAndServeTLS(s.config.ControlAddress, s.config.CertFile, s.config.KeyFile, mux)
 	}
 
-	log.Printf("Starting control server without TLS on %s", s.config.ControlAddress)
-	log.Printf("WARNING: Running without TLS is not recommended for production")
+	s.logger.Printf("Starting control server without TLS on %s", s.config.ControlAddress)
+	s.logger.Printf("WARNING: Running without TLS is not recommended for production")
 	return http.ListenAndServe(s.config.ControlAddress, mux)
 }
 
@@ -207,27 +238,27 @@ func (s *Server) startForward(config ForwardConfig) error {
 
 	// Detect if this is HTTP traffic
 	isHTTP := false
-	if config.TrafficType == "http" ||
-		strings.HasSuffix(config.ListenAddress, ":80") ||
-		strings.HasSuffix(config.ListenAddress, ":443") ||
-		strings.HasSuffix(config.ListenAddress, ":8080") ||
-		strings.HasSuffix(config.ListenAddress, ":8123") {
+	if config.TrafficType == "http" || common.IsHTTPTraffic(config.ListenAddress) {
 		isHTTP = true
-		log.Printf("HTTP traffic detected for forward %s", config.Name)
+		s.logger.Printf("HTTP traffic detected for forward %s", config.Name)
 	}
+
+	// Create a logger for this forward
+	forwardLogger := log.New(os.Stdout, fmt.Sprintf("[FWD:%s] ", config.Name), log.LstdFlags)
 
 	forward := &Forward{
 		config:   config,
 		listener: listener,
 		server:   s,
 		isHTTP:   isHTTP,
+		logger:   forwardLogger,
 	}
 
 	s.forwardsMutex.Lock()
 	s.forwards[config.Name] = forward
 	s.forwardsMutex.Unlock()
 
-	log.Printf("Started forwarding listener %s on %s for client %s",
+	s.logger.Printf("Started forwarding listener %s on %s for client %s",
 		config.Name, config.ListenAddress, config.TargetClient)
 
 	// Accept connections in a goroutine
@@ -241,7 +272,7 @@ func (f *Forward) acceptConnections() {
 	for {
 		conn, err := f.listener.Accept()
 		if err != nil {
-			log.Printf("Error accepting connection on %s: %v", f.config.ListenAddress, err)
+			f.logger.Printf("Error accepting connection on %s: %v", f.config.ListenAddress, err)
 			if netErr, ok := err.(net.Error); ok && netErr.Temporary() {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -249,7 +280,7 @@ func (f *Forward) acceptConnections() {
 			break
 		}
 
-		log.Printf("Accepted new connection on %s", f.config.ListenAddress)
+		f.logger.Printf("Accepted new connection on %s", f.config.ListenAddress)
 		// Handle the connection in a goroutine
 		go f.handleConnection(conn)
 	}
@@ -262,7 +293,7 @@ func (f *Forward) handleConnection(conn net.Conn) {
 	connID := fmt.Sprintf("%s-%d", f.config.Name, f.connCount)
 	f.countMutex.Unlock()
 
-	log.Printf("New connection %s on forwarding listener %s", connID, f.config.Name)
+	f.logger.Printf("New connection %s on forwarding listener %s", connID, f.config.Name)
 
 	// Find the target client
 	f.server.clientsMutex.RLock()
@@ -270,7 +301,7 @@ func (f *Forward) handleConnection(conn net.Conn) {
 	f.server.clientsMutex.RUnlock()
 
 	if !exists || !client.isActive {
-		log.Printf("Target client %s not connected, closing connection %s", f.config.TargetClient, connID)
+		f.logger.Printf("Target client %s not connected, closing connection %s", f.config.TargetClient, connID)
 		conn.Close()
 		return
 	}
@@ -291,50 +322,40 @@ func (f *Forward) handleConnection(conn net.Conn) {
 	client.connTracker[connID] = forwarded
 	client.connMutex.Unlock()
 
-	log.Printf("Registered connection %s with client %s", connID, client.ID)
+	f.logger.Printf("Registered connection %s with client %s", connID, client.ID)
 
-	// Notify the client about the new connection using binary protocol
-	// Format: [type][conn ID len][conn ID][forward ID len][forward ID][dest addr len][dest addr]
-	connIDBytes := []byte(connID)
-	forwardIDBytes := []byte(f.config.Name)
-	destAddrBytes := []byte(f.config.DestinationAddress)
-
-	msgSize := 1 + 4 + len(connIDBytes) + 4 + len(forwardIDBytes) + 4 + len(destAddrBytes)
-	buf := bytes.NewBuffer(make([]byte, 0, msgSize))
-
-	buf.WriteByte(MessageTypeNewConn)
-	binary.Write(buf, binary.BigEndian, uint32(len(connIDBytes)))
-	buf.Write(connIDBytes)
-	binary.Write(buf, binary.BigEndian, uint32(len(forwardIDBytes)))
-	buf.Write(forwardIDBytes)
-	binary.Write(buf, binary.BigEndian, uint32(len(destAddrBytes)))
-	buf.Write(destAddrBytes)
+	// Notify the client about the new connection
+	newConnMsg := common.CreateNewConnMessage(connID, f.config.Name, f.config.DestinationAddress)
 
 	// Send the message
 	client.writeMutex.Lock()
-	err := client.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
+	err := client.conn.WriteMessage(websocket.BinaryMessage, newConnMsg)
 	client.writeMutex.Unlock()
 
 	if err != nil {
-		log.Printf("Error sending new connection message to client %s for connection %s: %v",
+		f.logger.Printf("Error sending new connection message to client %s for connection %s: %v",
 			client.ID, connID, err)
 		conn.Close()
+		
+		client.connMutex.Lock()
+		delete(client.connTracker, connID)
+		client.connMutex.Unlock()
 		return
 	}
 
-	log.Printf("Sent new connection notification to client %s for connection %s", client.ID, connID)
+	f.logger.Printf("Sent new connection notification to client %s for connection %s", client.ID, connID)
 
 	// Choose buffer based on connection type
 	var buffer []byte
 	var idleTimeout time.Duration
 
 	if f.isHTTP {
-		buffer = make([]byte, 64*1024) // Larger buffer for HTTP
-		idleTimeout = 30 * time.Second
+		buffer = make([]byte, f.server.config.BufferSizeHTTP) // Larger buffer for HTTP
+		idleTimeout = time.Duration(f.server.config.IdleTimeoutHTTP) * time.Second
 	} else {
 		buffer = f.server.bufferPool.Get().([]byte)
 		defer f.server.bufferPool.Put(buffer)
-		idleTimeout = 5 * time.Second
+		idleTimeout = time.Duration(f.server.config.IdleTimeout) * time.Second
 	}
 
 	// Set initial timeout
@@ -347,16 +368,16 @@ func (f *Forward) handleConnection(conn net.Conn) {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Just a timeout, reset deadline and continue for HTTP connections
 				if f.isHTTP {
-					log.Printf("HTTP connection %s idle, extending timeout", connID)
+					f.logger.Printf("HTTP connection %s idle, extending timeout", connID)
 					conn.SetReadDeadline(time.Now().Add(idleTimeout))
 					continue
 				}
 			}
 
 			if err != io.EOF {
-				log.Printf("Error reading from connection %s: %v", connID, err)
+				f.logger.Printf("Error reading from connection %s: %v", connID, err)
 			} else {
-				log.Printf("Connection %s closed by remote end", connID)
+				f.logger.Printf("Connection %s closed by remote end", connID)
 			}
 			break
 		}
@@ -366,25 +387,15 @@ func (f *Forward) handleConnection(conn net.Conn) {
 
 		forwarded.lastActivity = time.Now()
 
-		// Send data to client using binary protocol
-		// Format: [type][conn ID len][conn ID][forward ID len][forward ID][data len][data]
-		dataSize := 1 + 4 + len(connIDBytes) + 4 + len(forwardIDBytes) + 4 + n
-		dataBuf := bytes.NewBuffer(make([]byte, 0, dataSize))
-
-		dataBuf.WriteByte(MessageTypeData)
-		binary.Write(dataBuf, binary.BigEndian, uint32(len(connIDBytes)))
-		dataBuf.Write(connIDBytes)
-		binary.Write(dataBuf, binary.BigEndian, uint32(len(forwardIDBytes)))
-		dataBuf.Write(forwardIDBytes)
-		binary.Write(dataBuf, binary.BigEndian, uint32(n))
-		dataBuf.Write(buffer[:n])
+		// Send data to client
+		dataMsg := common.CreateDataMessage(connID, f.config.Name, buffer[:n])
 
 		client.writeMutex.Lock()
-		err = client.conn.WriteMessage(websocket.BinaryMessage, dataBuf.Bytes())
+		err = client.conn.WriteMessage(websocket.BinaryMessage, dataMsg)
 		client.writeMutex.Unlock()
 
 		if err != nil {
-			log.Printf("Error sending data to client %s for connection %s: %v",
+			f.logger.Printf("Error sending data to client %s for connection %s: %v",
 				client.ID, connID, err)
 			break
 		}
@@ -396,121 +407,101 @@ func (f *Forward) handleConnection(conn net.Conn) {
 	delete(client.connTracker, connID)
 	client.connMutex.Unlock()
 
-	log.Printf("Connection %s closed and cleaned up", connID)
+	f.logger.Printf("Connection %s closed and cleaned up", connID)
 
 	// For HTTP connections, delay the close message to allow time for any in-flight data
 	if f.isHTTP {
-		log.Printf("HTTP connection %s - delaying close message by 100ms", connID)
-		time.Sleep(100 * time.Millisecond)
+		f.logger.Printf("HTTP connection %s - delaying close message by 100ms", connID)
+		time.Sleep(time.Duration(common.HTTPCloseDelay) * time.Millisecond)
 	}
 
-	// Notify client that connection is closed using binary protocol
-	// Format: [type][conn ID len][conn ID][forward ID len][forward ID]
-	closeBuf := bytes.NewBuffer(make([]byte, 0, 1+4+len(connIDBytes)+4+len(forwardIDBytes)))
-
-	closeBuf.WriteByte(MessageTypeClose)
-	binary.Write(closeBuf, binary.BigEndian, uint32(len(connIDBytes)))
-	closeBuf.Write(connIDBytes)
-	binary.Write(closeBuf, binary.BigEndian, uint32(len(forwardIDBytes)))
-	closeBuf.Write(forwardIDBytes)
+	// Notify client that connection is closed
+	closeMsg := common.CreateCloseMessage(connID, f.config.Name)
 
 	client.writeMutex.Lock()
-	client.conn.WriteMessage(websocket.BinaryMessage, closeBuf.Bytes()) // Ignore error as client might be gone
+	client.conn.WriteMessage(websocket.BinaryMessage, closeMsg) // Ignore error as client might be gone
 	client.writeMutex.Unlock()
 
-	log.Printf("Sent close notification to client %s for connection %s", client.ID, connID)
-}
-
-// validateHMAC validates the HMAC signature from the client
-func (s *Server) validateHMAC(clientID string, timestamp int64, nonce string, signature string, accessKey string) bool {
-	// Check if timestamp is within acceptable window
-	now := time.Now().Unix()
-	if now-timestamp > int64(s.config.AuthTimeout) {
-		log.Printf("Authentication attempt from %s rejected: timestamp too old (%d seconds)",
-			clientID, now-timestamp)
-		return false
-	}
-
-	// Recreate the message
-	message := fmt.Sprintf("%s:%d:%s", clientID, timestamp, nonce)
-
-	// Create HMAC
-	h := hmac.New(sha256.New, []byte(accessKey))
-	h.Write([]byte(message))
-	expectedMAC := base64.StdEncoding.EncodeToString(h.Sum(nil))
-
-	// Constant-time comparison to prevent timing attacks
-	return hmac.Equal([]byte(signature), []byte(expectedMAC))
-}
-
-// handleControlConnection handles a WebSocket control connection
+	f.logger.Printf("Sent close notification to client %s for connection %s", client.ID, connID)
+	// handleControlConnection handles a WebSocket control connection
 func (s *Server) handleControlConnection(w http.ResponseWriter, r *http.Request) {
-	log.Printf("New connection from %s, upgrading to WebSocket", r.RemoteAddr)
+	s.logger.Printf("New connection from %s, upgrading to WebSocket", r.RemoteAddr)
 
 	conn, err := s.upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Printf("Error upgrading connection from %s: %v", r.RemoteAddr, err)
+		s.logger.Printf("Error upgrading connection from %s: %v", r.RemoteAddr, err)
 		return
 	}
 
-	// Enable keep-alive pings with a shorter interval
-	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	// Enable keep-alive with pong handler
+	readTimeout := time.Duration(s.config.ReadTimeout) * time.Second
+	conn.SetReadDeadline(time.Now().Add(readTimeout))
 	conn.SetPongHandler(func(string) error {
-		log.Printf("Received pong from client at %s", r.RemoteAddr)
-		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		s.logger.Printf("Received pong from client at %s", r.RemoteAddr)
+		conn.SetReadDeadline(time.Now().Add(readTimeout))
 		return nil
 	})
 
 	defer func() {
-		log.Printf("Closing WebSocket connection from %s", r.RemoteAddr)
+		s.logger.Printf("Closing WebSocket connection from %s", r.RemoteAddr)
 		conn.Close()
 	}()
 
 	// Set a deadline for authentication
 	conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 
-	// Wait for authentication (still using JSON for auth to simplify client configuration)
-	log.Printf("Waiting for authentication from %s", r.RemoteAddr)
+	// Wait for authentication
+	s.logger.Printf("Waiting for authentication from %s", r.RemoteAddr)
 	_, msgBytes, err := conn.ReadMessage()
 	if err != nil {
-		log.Printf("Error reading auth message from %s: %v", r.RemoteAddr, err)
+		s.logger.Printf("Error reading auth message from %s: %v", r.RemoteAddr, err)
 		return
 	}
 
 	// First byte should be the message type
-	if len(msgBytes) == 0 || msgBytes[0] != MessageTypeAuth {
-		log.Printf("Expected auth message from %s, got type %d", r.RemoteAddr, msgBytes[0])
-		resp := AuthResponse{Success: false, Message: "Authentication required"}
-		respBytes := serializeAuthResponse(resp)
+	if len(msgBytes) == 0 || msgBytes[0] != common.MessageTypeAuth {
+		s.logger.Printf("Expected auth message from %s, got type %d", r.RemoteAddr, msgBytes[0])
+		resp := common.AuthResponse{Success: false, Message: "Authentication required"}
+		respBytes := common.SerializeAuthResponse(resp)
 		conn.WriteMessage(websocket.BinaryMessage, respBytes)
 		return
 	}
 
 	// Parse auth request
-	authReq, err := deserializeAuthRequest(msgBytes[1:])
+	authReq, err := common.DeserializeAuthRequest(msgBytes[1:])
 	if err != nil {
-		log.Printf("Error parsing auth request from %s: %v", r.RemoteAddr, err)
+		s.logger.Printf("Error parsing auth request from %s: %v", r.RemoteAddr, err)
 		return
 	}
 
-	log.Printf("Received authentication request from client %s at %s",
+	s.logger.Printf("Received authentication request from client %s at %s",
 		authReq.ClientID, r.RemoteAddr)
 
 	// Check if client ID exists
 	accessKey, exists := s.config.AuthorizedKeys[authReq.ClientID]
 	if !exists {
-		log.Printf("Unknown client ID from %s: %s", r.RemoteAddr, authReq.ClientID)
-		resp := AuthResponse{Success: false, Message: "Unknown client ID"}
-		respBytes := serializeAuthResponse(resp)
+		s.logger.Printf("Unknown client ID from %s: %s", r.RemoteAddr, authReq.ClientID)
+		resp := common.AuthResponse{Success: false, Message: "Unknown client ID"}
+		respBytes := common.SerializeAuthResponse(resp)
 		conn.WriteMessage(websocket.BinaryMessage, respBytes)
 		return
 	}
 
 	// Validate HMAC
-	if !s.validateHMAC(authReq.ClientID, authReq.Timestamp, authReq.Nonce, authReq.HMACDigest, accessKey) {
-		log.Printf("Invalid HMAC from client %s at %s", authReq.ClientID, r.RemoteAddr)
-		resp := AuthResponse{Success: false, Message: "Invalid authentication"}
-		respBytes := serializeAuthResponse(resp)
+	valid, msg := common.ValidateHMAC(
+		authReq.ClientID, 
+		authReq.Timestamp, 
+		authReq.Nonce, 
+		authReq.HMACDigest, 
+		accessKey, 
+		int64(s.config.AuthTimeout),
+		s.nonceCache,
+	)
+	
+	if !valid {
+		s.logger.Printf("Invalid authentication from client %s at %s: %s", authReq.ClientID, r.RemoteAddr, msg)
+		resp := common.AuthResponse{Success: false, Message: fmt.Sprintf("Invalid authentication: %s", msg)}
+		respBytes := common.SerializeAuthResponse(resp)
 		conn.WriteMessage(websocket.BinaryMessage, respBytes)
 		return
 	}
@@ -519,6 +510,8 @@ func (s *Server) handleControlConnection(w http.ResponseWriter, r *http.Request)
 	conn.SetReadDeadline(time.Time{})
 
 	// Create client
+	clientLogger := log.New(os.Stdout, fmt.Sprintf("[CLIENT:%s] ", authReq.ClientID), log.LstdFlags)
+	
 	client := &Client{
 		ID:           authReq.ClientID,
 		conn:         conn,
@@ -526,36 +519,37 @@ func (s *Server) handleControlConnection(w http.ResponseWriter, r *http.Request)
 		connTracker:  make(map[string]*ForwardedConn),
 		isActive:     true,
 		lastActivity: time.Now(),
+		logger:       clientLogger,
 	}
 
 	// Register the client
 	s.clientsMutex.Lock()
 	if existing, exists := s.clients[client.ID]; exists {
 		// Close existing connection
-		log.Printf("Client %s already connected, closing previous connection", client.ID)
+		s.logger.Printf("Client %s already connected, closing previous connection", client.ID)
 		existing.conn.Close()
 		existing.isActive = false
 	}
 	s.clients[client.ID] = client
 	s.clientsMutex.Unlock()
 
-	log.Printf("Client %s connected and authenticated from %s", client.ID, r.RemoteAddr)
+	s.logger.Printf("Client %s connected and authenticated from %s", client.ID, r.RemoteAddr)
 
 	// Send auth success
-	log.Printf("Sending authentication success response to client %s", client.ID)
-	resp := AuthResponse{Success: true, Message: "Authentication successful"}
-	respBytes := serializeAuthResponse(resp)
+	s.logger.Printf("Sending authentication success response to client %s", client.ID)
+	resp := common.AuthResponse{Success: true, Message: "Authentication successful"}
+	respBytes := common.SerializeAuthResponse(resp)
 
 	client.writeMutex.Lock()
 	err = conn.WriteMessage(websocket.BinaryMessage, respBytes)
 	client.writeMutex.Unlock()
 
 	if err != nil {
-		log.Printf("Error sending auth success to %s: %v", client.ID, err)
+		s.logger.Printf("Error sending auth success to %s: %v", client.ID, err)
 		return
 	}
 
-	log.Printf("Starting message handler and heartbeat for client %s", client.ID)
+	s.logger.Printf("Starting message handler and heartbeat for client %s", client.ID)
 
 	// Use a WaitGroup to ensure proper shutdown coordination
 	var wg sync.WaitGroup
@@ -579,83 +573,6 @@ func (s *Server) handleControlConnection(w http.ResponseWriter, r *http.Request)
 	wg.Wait()
 }
 
-// Serialize auth response to binary
-func serializeAuthResponse(resp AuthResponse) []byte {
-	// Format: [type][success flag][message len][message]
-	msgBytes := []byte(resp.Message)
-	buf := bytes.NewBuffer(make([]byte, 0, 1+1+4+len(msgBytes)))
-
-	buf.WriteByte(MessageTypeAuthResponse)
-	if resp.Success {
-		buf.WriteByte(1)
-	} else {
-		buf.WriteByte(0)
-	}
-
-	binary.Write(buf, binary.BigEndian, uint32(len(msgBytes)))
-	buf.Write(msgBytes)
-
-	return buf.Bytes()
-}
-
-// Deserialize auth request from binary
-func deserializeAuthRequest(data []byte) (AuthRequest, error) {
-	var req AuthRequest
-	buf := bytes.NewBuffer(data)
-
-	// Read client ID
-	var clientIDLen uint32
-	err := binary.Read(buf, binary.BigEndian, &clientIDLen)
-	if err != nil {
-		return req, err
-	}
-
-	clientIDBytes := make([]byte, clientIDLen)
-	_, err = buf.Read(clientIDBytes)
-	if err != nil {
-		return req, err
-	}
-	req.ClientID = string(clientIDBytes)
-
-	// Read timestamp
-	var timestamp uint32
-	err = binary.Read(buf, binary.BigEndian, &timestamp)
-	if err != nil {
-		return req, err
-	}
-	req.Timestamp = int64(timestamp)
-
-	// Read nonce
-	var nonceLen uint32
-	err = binary.Read(buf, binary.BigEndian, &nonceLen)
-	if err != nil {
-		return req, err
-	}
-
-	nonceBytes := make([]byte, nonceLen)
-	_, err = buf.Read(nonceBytes)
-	if err != nil {
-		return req, err
-	}
-	req.Nonce = string(nonceBytes)
-
-	// Read HMAC
-	var hmacLen uint32
-	err = binary.Read(buf, binary.BigEndian, &hmacLen)
-	if err != nil {
-		return req, err
-	}
-
-	hmacBytes := make([]byte, hmacLen)
-	_, err = buf.Read(hmacBytes)
-	if err != nil {
-		return req, err
-	}
-	req.HMACDigest = string(hmacBytes)
-
-	return req, nil
-}
-
 // handleMessages handles incoming messages from a client
 func (c *Client) handleMessages(done chan struct{}) {
 	defer func() {
@@ -672,7 +589,7 @@ func (c *Client) handleMessages(done chan struct{}) {
 		}
 		c.connMutex.Unlock()
 
-		log.Printf("Client %s message handler exited", c.ID)
+		c.logger.Printf("Client %s message handler exited", c.ID)
 		close(done)
 	}()
 
@@ -680,7 +597,7 @@ func (c *Client) handleMessages(done chan struct{}) {
 		// Read message using binary protocol
 		msgType, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			log.Printf("Error reading message from client %s: %v", c.ID, err)
+			c.logger.Printf("Error reading message from client %s: %v", c.ID, err)
 			break
 		}
 
@@ -688,213 +605,226 @@ func (c *Client) handleMessages(done chan struct{}) {
 
 		// Handle control messages (ping, pong, close)
 		if msgType == websocket.PingMessage {
-			log.Printf("Received WebSocket ping from client %s, responding with pong", c.ID)
+			c.logger.Printf("Received WebSocket ping from client %s, responding with pong", c.ID)
 			c.writeMutex.Lock()
 			c.conn.WriteMessage(websocket.PongMessage, nil)
 			c.writeMutex.Unlock()
 			continue
 		} else if msgType == websocket.PongMessage {
-			log.Printf("Received WebSocket pong from client %s", c.ID)
+			c.logger.Printf("Received WebSocket pong from client %s", c.ID)
 			continue
 		} else if msgType == websocket.CloseMessage {
-			log.Printf("Received close frame from client %s", c.ID)
+			c.logger.Printf("Received close frame from client %s", c.ID)
 			return
 		} else if msgType != websocket.BinaryMessage {
-			log.Printf("Received unexpected WebSocket message type from client %s: %d", c.ID, msgType)
+			c.logger.Printf("Received unexpected WebSocket message type from client %s: %d", c.ID, msgType)
 			continue
 		}
 
 		if len(msgBytes) == 0 {
-			log.Printf("Received empty message from client %s", c.ID)
+			c.logger.Printf("Received empty message from client %s", c.ID)
 			continue
 		}
 
 		// Handle based on message type
-		msgType = int(msgBytes[0])
+		messageType := msgBytes[0]
 		payload := msgBytes[1:]
 
-		switch msgBytes[0] {
-		case MessageTypeData:
-			// Parse data message
-			// Format: [conn ID len][conn ID][forward ID len][forward ID][data len][data]
-			buf := bytes.NewBuffer(payload)
-
-			var connIDLen uint32
-			err := binary.Read(buf, binary.BigEndian, &connIDLen)
-			if err != nil {
-				log.Printf("Error reading conn ID length from client %s: %v", c.ID, err)
-				continue
-			}
-
-			connIDBytes := make([]byte, connIDLen)
-			_, err = buf.Read(connIDBytes)
-			if err != nil {
-				log.Printf("Error reading conn ID from client %s: %v", c.ID, err)
-				continue
-			}
-			connID := string(connIDBytes)
-
-			var forwardIDLen uint32
-			err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
-			if err != nil {
-				log.Printf("Error reading forward ID length from client %s: %v", c.ID, err)
-				continue
-			}
-
-			forwardIDBytes := make([]byte, forwardIDLen)
-			_, err = buf.Read(forwardIDBytes)
-			if err != nil {
-				log.Printf("Error reading forward ID from client %s: %v", c.ID, err)
-				continue
-			}
-
-			var dataLen uint32
-			err = binary.Read(buf, binary.BigEndian, &dataLen)
-			if err != nil {
-				log.Printf("Error reading data length from client %s: %v", c.ID, err)
-				continue
-			}
-
-			data := make([]byte, dataLen)
-			_, err = buf.Read(data)
-			if err != nil {
-				log.Printf("Error reading data from client %s: %v", c.ID, err)
-				continue
-			}
-
-			// Find connection with race condition handling
-			c.connMutex.RLock()
-			conn, exists := c.connTracker[connID]
-			c.connMutex.RUnlock()
-
-			if !exists {
-				// Check if this is a race condition with a connection that's being closed
-				// Add a small delay before giving up
-				log.Printf("Connection %s not found for client %s, waiting briefly", connID, c.ID)
-
-				time.Sleep(50 * time.Millisecond)
-
-				// Check again
-				c.connMutex.RLock()
-				conn, exists = c.connTracker[connID]
-				c.connMutex.RUnlock()
-
-				if !exists {
-					log.Printf("Connection %s still not found for client %s after delay", connID, c.ID)
-					continue
-				} else {
-					log.Printf("Connection %s found for client %s after delay", connID, c.ID)
-				}
-			}
-
-			// Write data to connection
-			_, err = conn.conn.Write(data)
-			if err != nil {
-				log.Printf("Error writing to connection %s: %v", connID, err)
-				conn.conn.Close()
-
-				c.connMutex.Lock()
-				delete(c.connTracker, connID)
-				c.connMutex.Unlock()
-			}
-
-		case MessageTypeClose:
-			// Parse close message
-			// Format: [conn ID len][conn ID][forward ID len][forward ID]
-			buf := bytes.NewBuffer(payload)
-
-			var connIDLen uint32
-			err := binary.Read(buf, binary.BigEndian, &connIDLen)
-			if err != nil {
-				log.Printf("Error reading conn ID length from client %s: %v", c.ID, err)
-				continue
-			}
-
-			connIDBytes := make([]byte, connIDLen)
-			_, err = buf.Read(connIDBytes)
-			if err != nil {
-				log.Printf("Error reading conn ID from client %s: %v", c.ID, err)
-				continue
-			}
-			connID := string(connIDBytes)
-
-			log.Printf("Received close request for connection %s from client %s", connID, c.ID)
-
-			// Find and close connection
-			c.connMutex.RLock()
-			conn, exists := c.connTracker[connID]
-			c.connMutex.RUnlock()
-
-			if exists {
-				conn.conn.Close()
-
-				c.connMutex.Lock()
-				delete(c.connTracker, connID)
-				c.connMutex.Unlock()
-
-				log.Printf("Closed connection %s per client %s request", connID, c.ID)
-			}
-
-		case MessageTypePing:
-			log.Printf("Received ping from client %s", c.ID)
-			// Respond with pong (simple binary message)
-			pongMsg := []byte{MessageTypePong}
-			c.writeMutex.Lock()
-			err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
-			c.writeMutex.Unlock()
-
-			if err != nil {
-				log.Printf("Error sending pong to client %s: %v", c.ID, err)
-			} else {
-				log.Printf("Sent pong to client %s", c.ID)
-			}
-
-		case MessageTypePong:
-			log.Printf("Received application-level pong from client %s", c.ID)
-			// Just update last activity time
-			// Already done at the start of the message handler
+		switch messageType {
+		case common.MessageTypeData:
+			c.handleDataMessage(payload)
+		case common.MessageTypeClose:
+			c.handleCloseMessage(payload)
+		case common.MessageTypePing:
+			c.handlePingMessage()
+		case common.MessageTypePong:
+			c.logger.Printf("Received application-level pong from client %s", c.ID)
+		default:
+			c.logger.Printf("Received unknown message type from client %s: %d", c.ID, messageType)
 		}
+	}
+}
+
+// handleDataMessage processes data messages from clients
+func (c *Client) handleDataMessage(payload []byte) {
+	// Parse data message
+	// Format: [conn ID len][conn ID][forward ID len][forward ID][data len][data]
+	buf := bytes.NewBuffer(payload)
+
+	var connIDLen uint32
+	err := binary.Read(buf, binary.BigEndian, &connIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID length from client %s: %v", c.ID, err)
+		return
+	}
+
+	connIDBytes := make([]byte, connIDLen)
+	_, err = buf.Read(connIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID from client %s: %v", c.ID, err)
+		return
+	}
+	connID := string(connIDBytes)
+
+	var forwardIDLen uint32
+	err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID length from client %s: %v", c.ID, err)
+		return
+	}
+
+	forwardIDBytes := make([]byte, forwardIDLen)
+	_, err = buf.Read(forwardIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading forward ID from client %s: %v", c.ID, err)
+		return
+	}
+
+	var dataLen uint32
+	err = binary.Read(buf, binary.BigEndian, &dataLen)
+	if err != nil {
+		c.logger.Printf("Error reading data length from client %s: %v", c.ID, err)
+		return
+	}
+
+	data := make([]byte, dataLen)
+	_, err = buf.Read(data)
+	if err != nil {
+		c.logger.Printf("Error reading data from client %s: %v", c.ID, err)
+		return
+	}
+
+	// Find connection with race condition handling
+	c.connMutex.RLock()
+	conn, exists := c.connTracker[connID]
+	c.connMutex.RUnlock()
+
+	if !exists {
+		// Check if this is a race condition with a connection that's being closed
+		// Add a small delay before giving up
+		c.logger.Printf("Connection %s not found for client %s, waiting briefly", connID, c.ID)
+
+		time.Sleep(time.Duration(common.RaceConditionDelay) * time.Millisecond)
+
+		// Check again
+		c.connMutex.RLock()
+		conn, exists = c.connTracker[connID]
+		c.connMutex.RUnlock()
+
+		if !exists {
+			c.logger.Printf("Connection %s still not found for client %s after delay", connID, c.ID)
+			return
+		} else {
+			c.logger.Printf("Connection %s found for client %s after delay", connID, c.ID)
+		}
+	}
+
+	// Write data to connection
+	_, err = conn.conn.Write(data)
+	if err != nil {
+		c.logger.Printf("Error writing to connection %s: %v", connID, err)
+		conn.conn.Close()
+
+		c.connMutex.Lock()
+		delete(c.connTracker, connID)
+		c.connMutex.Unlock()
+	}
+}
+
+// handleCloseMessage processes close messages from clients
+func (c *Client) handleCloseMessage(payload []byte) {
+	// Parse close message
+	// Format: [conn ID len][conn ID][forward ID len][forward ID]
+	buf := bytes.NewBuffer(payload)
+
+	var connIDLen uint32
+	err := binary.Read(buf, binary.BigEndian, &connIDLen)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID length from client %s: %v", c.ID, err)
+		return
+	}
+
+	connIDBytes := make([]byte, connIDLen)
+	_, err = buf.Read(connIDBytes)
+	if err != nil {
+		c.logger.Printf("Error reading conn ID from client %s: %v", c.ID, err)
+		return
+	}
+	connID := string(connIDBytes)
+
+	c.logger.Printf("Received close request for connection %s from client %s", connID, c.ID)
+
+	// Find and close connection
+	c.connMutex.RLock()
+	conn, exists := c.connTracker[connID]
+	c.connMutex.RUnlock()
+
+	if exists {
+		conn.conn.Close()
+
+		c.connMutex.Lock()
+		delete(c.connTracker, connID)
+		c.connMutex.Unlock()
+
+		c.logger.Printf("Closed connection %s per client %s request", connID, c.ID)
+	}
+}
+
+// handlePingMessage handles ping messages from clients
+func (c *Client) handlePingMessage() {
+	c.logger.Printf("Received ping from client %s", c.ID)
+	// Respond with pong (simple binary message)
+	pongMsg := common.CreatePongMessage()
+	c.writeMutex.Lock()
+	err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
+	c.writeMutex.Unlock()
+
+	if err != nil {
+		c.logger.Printf("Error sending pong to client %s: %v", c.ID, err)
+	} else {
+		c.logger.Printf("Sent pong to client %s", c.ID)
 	}
 }
 
 // startHeartbeat starts a heartbeat goroutine for the client
 func (c *Client) startHeartbeat(done chan struct{}) {
-	ticker := time.NewTicker(15 * time.Second) // More frequent heartbeats
+	ticker := time.NewTicker(time.Duration(c.server.config.HeartbeatInterval) * time.Second)
 	defer ticker.Stop()
 
-	log.Printf("Started heartbeat for client %s", c.ID)
+	c.logger.Printf("Started heartbeat for client %s", c.ID)
 
 	for {
 		select {
 		case <-ticker.C:
 			if !c.isActive {
-				log.Printf("Client %s is no longer active", c.ID)
+				c.logger.Printf("Client %s is no longer active", c.ID)
 				return
 			}
 
 			// Check if client is still active
-			if time.Since(c.lastActivity) > 45*time.Second {
-				log.Printf("Client %s timed out (no activity for >45s)", c.ID)
+			heartbeatTimeout := time.Duration(c.server.config.HeartbeatTimeout) * time.Second
+			if time.Since(c.lastActivity) > heartbeatTimeout {
+				c.logger.Printf("Client %s timed out (no activity for >%ds)", c.ID, c.server.config.HeartbeatTimeout)
 				c.conn.Close()
 				return
 			}
 
 			// Send ping using binary protocol
-			log.Printf("Sending ping to client %s", c.ID)
-			pingMsg := []byte{MessageTypePing}
+			c.logger.Printf("Sending ping to client %s", c.ID)
+			pingMsg := common.CreatePingMessage()
 
 			c.writeMutex.Lock()
 			err := c.conn.WriteMessage(websocket.BinaryMessage, pingMsg)
 			c.writeMutex.Unlock()
 
 			if err != nil {
-				log.Printf("Error sending ping to client %s: %v", c.ID, err)
+				c.logger.Printf("Error sending ping to client %s: %v", c.ID, err)
 				c.conn.Close()
 				return
 			}
 
 		case <-done:
-			log.Printf("Heartbeat for client %s stopped due to client disconnection", c.ID)
+			c.logger.Printf("Heartbeat for client %s stopped due to client disconnection", c.ID)
 			return
 		}
 	}
