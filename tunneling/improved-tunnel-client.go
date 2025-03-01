@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
@@ -15,9 +17,10 @@ import (
 	"syscall"
 	"time"
 
+	"tunneling/common" // our shared package
+
 	"github.com/gorilla/websocket"
 	"gopkg.in/yaml.v3"
-	"tunneling/common" // our new shared package
 )
 
 // Config represents the client configuration
@@ -50,24 +53,26 @@ type Config struct {
 	LogLevel string `yaml:"logLevel"`
 
 	// Timeouts in seconds
-	ReadTimeout int `yaml:"readTimeout"`
-	IdleTimeout int `yaml:"idleTimeout"`
-	IdleTimeoutHTTP int `yaml:"idleTimeoutHTTP"`
+	ReadTimeout       int `yaml:"readTimeout"`
+	IdleTimeout       int `yaml:"idleTimeout"`
+	IdleTimeoutHTTP   int `yaml:"idleTimeoutHTTP"`
 	HeartbeatInterval int `yaml:"heartbeatInterval"`
-	HeartbeatTimeout int `yaml:"heartbeatTimeout"`
+	HeartbeatTimeout  int `yaml:"heartbeatTimeout"`
 
 	// Buffer sizes
-	ReadBufferSize int `yaml:"readBufferSize"`
+	ReadBufferSize  int `yaml:"readBufferSize"`
 	WriteBufferSize int `yaml:"writeBufferSize"`
-	BufferSize int `yaml:"bufferSize"`
-	BufferSizeHTTP int `yaml:"bufferSizeHTTP"`
+	BufferSize      int `yaml:"bufferSize"`
+	BufferSizeHTTP  int `yaml:"bufferSizeHTTP"`
 }
 
 // Client represents the tunnel client
 type Client struct {
-	config       Config
-	conn         *websocket.Conn
-	connections  map[string]*LocalConnection
+	config      Config
+	conn        *websocket.Conn
+	connections map[string]*LocalConnection // Map of base ID to connection
+	// Track connection metadata separately to handle versioning and grace periods
+	connInfo     map[string]*common.ConnectionInfo
 	connMutex    sync.RWMutex
 	done         chan struct{}
 	reconnecting bool
@@ -76,17 +81,18 @@ type Client struct {
 	// Buffer pool for reusing buffers
 	bufferPool sync.Pool
 	logger     *log.Logger
+	// Cleanup ticker for removing connections after grace period
+	cleanupTicker *time.Ticker
 }
 
 // LocalConnection represents a connection to a local service
 type LocalConnection struct {
-	ID              string
+	ID              string // Base ID without version
 	conn            net.Conn
 	client          *Client
 	destinationAddr string
 	forwardID       string
-	lastActivity    time.Time
-	isHTTP          bool
+	buffer          []byte
 }
 
 // NewClient creates a new tunnel client
@@ -108,7 +114,7 @@ func NewClient(configFile string) (*Client, error) {
 	if config.ReconnectDelay == 0 {
 		config.ReconnectDelay = common.DefaultReconnectDelay
 	}
-	
+
 	// Set security defaults - ensure secure by default
 	if !config.UseTLS {
 		log.Println("WARNING: TLS is disabled. This is not recommended for production use.")
@@ -116,11 +122,11 @@ func NewClient(configFile string) (*Client, error) {
 		// If not explicitly disabled, enable security features
 		config.UseTLS = true
 	}
-	
+
 	if !config.VerifyCert {
 		log.Println("WARNING: TLS certificate verification is disabled. This is not recommended for production use.")
 	} else {
-		// If not explicitly disabled, enable security features 
+		// If not explicitly disabled, enable security features
 		config.VerifyCert = true
 	}
 
@@ -161,13 +167,15 @@ func NewClient(configFile string) (*Client, error) {
 	client := &Client{
 		config:      config,
 		connections: make(map[string]*LocalConnection),
+		connInfo:    make(map[string]*common.ConnectionInfo),
 		done:        make(chan struct{}),
 		bufferPool: sync.Pool{
 			New: func() interface{} {
 				return make([]byte, config.BufferSize)
 			},
 		},
-		logger: logger,
+		logger:        logger,
+		cleanupTicker: time.NewTicker(100 * time.Millisecond), // Check for expired connections every 100ms
 	}
 
 	return client, nil
@@ -181,6 +189,9 @@ func (c *Client) Start() error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
 
+	// Start connection cleanup routine
+	go c.startConnectionCleanup()
+
 	go func() {
 		<-signals
 		c.logger.Println("Received shutdown signal")
@@ -192,6 +203,7 @@ func (c *Client) Start() error {
 	for {
 		select {
 		case <-c.done:
+			c.cleanupTicker.Stop()
 			return nil
 		default:
 			err := c.connect()
@@ -207,6 +219,7 @@ func (c *Client) Start() error {
 			// Connection failed or disconnected
 			attempt++
 			if attempt > c.config.MaxReconnectAttempts {
+				c.cleanupTicker.Stop()
 				return fmt.Errorf("exceeded maximum reconnection attempts")
 			}
 
@@ -218,9 +231,54 @@ func (c *Client) Start() error {
 			case <-time.After(delay):
 				// Continue with next attempt
 			case <-c.done:
+				c.cleanupTicker.Stop()
 				return nil
 			}
 		}
+	}
+}
+
+// startConnectionCleanup periodically checks for connections that should be removed
+func (c *Client) startConnectionCleanup() {
+	for {
+		select {
+		case <-c.cleanupTicker.C:
+			c.cleanupConnections()
+		case <-c.done:
+			return
+		}
+	}
+}
+
+// cleanupConnections removes connections that have exceeded their grace period
+func (c *Client) cleanupConnections() {
+	c.connMutex.Lock()
+	defer c.connMutex.Unlock()
+
+	var toRemove []string
+
+	// Find connections that should be removed
+	for baseID, info := range c.connInfo {
+		if info.ShouldBeRemoved() {
+			toRemove = append(toRemove, baseID)
+		}
+	}
+
+	// Remove them
+	for _, baseID := range toRemove {
+		// Return buffer to pool if it's not an HTTP connection
+		if conn, exists := c.connections[baseID]; exists {
+			if info, infoExists := c.connInfo[baseID]; infoExists && !info.IsHTTP {
+				if conn.buffer != nil {
+					c.bufferPool.Put(conn.buffer)
+					c.logger.Printf("Connection %s fully removed, buffer returned to pool",
+						info.VersionedID.String())
+				}
+			}
+			delete(c.connections, baseID)
+		}
+		delete(c.connInfo, baseID)
+		c.logger.Printf("Connection %s fully removed after grace period", baseID)
 	}
 }
 
@@ -239,7 +297,11 @@ func (c *Client) connect() error {
 	for _, conn := range c.connections {
 		conn.conn.Close()
 	}
-	c.connections = make(map[string]*LocalConnection)
+	// Mark all connections for removal
+	for baseID, info := range c.connInfo {
+		info.MarkForRemoval()
+		c.logger.Printf("Marked connection %s for removal", baseID)
+	}
 	c.connMutex.Unlock()
 
 	// Build WebSocket URL
@@ -342,16 +404,35 @@ func (c *Client) connect() error {
 	if !authResp.Success {
 		conn.Close()
 		return fmt.Errorf("authentication failed: %s", authResp.Message)
-		// handleMessages handles incoming messages from the server
+	}
+
+	c.logger.Printf("Authentication successful")
+
+	// Set up message handling and heartbeat
+	messageDone := make(chan struct{})
+	go c.handleMessages(messageDone)
+	go c.startHeartbeat(messageDone)
+
+	// Wait for message handler to exit
+	<-messageDone
+	c.logger.Printf("Connection closed")
+
+	return nil
+}
+
+// handleMessages handles incoming messages from the server
 func (c *Client) handleMessages(done chan struct{}) {
 	defer func() {
 		if !c.reconnecting {
 			c.conn.Close()
 
-			// Close all local connections
+			// Close all local connections and mark them for removal
 			c.connMutex.Lock()
-			for _, conn := range c.connections {
+			for baseID, conn := range c.connections {
 				conn.conn.Close()
+				if info, exists := c.connInfo[baseID]; exists {
+					info.MarkForRemoval()
+				}
 			}
 			c.connMutex.Unlock()
 
@@ -434,7 +515,11 @@ func (c *Client) handleNewConnMessage(payload []byte) {
 		c.logger.Printf("Error reading conn ID: %v", err)
 		return
 	}
-	connID := string(connIDBytes)
+	connIDStr := string(connIDBytes)
+
+	// Parse versioned connection ID
+	versionedID := common.ParseVersionedID(connIDStr)
+	baseID := versionedID.BaseID
 
 	var forwardIDLen uint32
 	err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
@@ -466,10 +551,11 @@ func (c *Client) handleNewConnMessage(payload []byte) {
 	}
 	destAddr := string(destAddrBytes)
 
-	c.logger.Printf("New connection request: %s, forwarding to %s", connID, destAddr)
+	c.logger.Printf("New connection request: %s (ID: %s), forwarding to %s",
+		versionedID.String(), baseID, destAddr)
 
 	// Handle the new connection
-	go c.handleNewConnection(connID, forwardID, destAddr)
+	go c.handleNewConnection(versionedID, baseID, forwardID, destAddr)
 }
 
 // handleDataMessage processes a data message from the server
@@ -491,7 +577,11 @@ func (c *Client) handleDataMessage(payload []byte) {
 		c.logger.Printf("Error reading conn ID: %v", err)
 		return
 	}
-	connID := string(connIDBytes)
+	connIDStr := string(connIDBytes)
+
+	// Parse versioned connection ID
+	versionedID := common.ParseVersionedID(connIDStr)
+	baseID := versionedID.BaseID
 
 	var forwardIDLen uint32
 	err = binary.Read(buf, binary.BigEndian, &forwardIDLen)
@@ -522,44 +612,45 @@ func (c *Client) handleDataMessage(payload []byte) {
 		return
 	}
 
-	// Find local connection with race condition handling
+	// Find local connection
 	c.connMutex.RLock()
-	localConn, exists := c.connections[connID]
+	localConn, exists := c.connections[baseID]
+	info, infoExists := c.connInfo[baseID]
 	c.connMutex.RUnlock()
 
-	if !exists {
-		// Check if this is a race condition with a connection that's being established
-		// Add a small delay before closing to give handleNewConnection time to establish
-		c.logger.Printf("Local connection %s not found, waiting briefly before closing", connID)
+	// Verify connection exists and versions match
+	if !exists || !infoExists {
+		c.logger.Printf("Local connection %s not found, rejecting data", versionedID.String())
+		c.sendCloseMessage(versionedID, forwardID)
+		return
+	}
 
-		// Wait a short time to see if connection gets established
-		time.Sleep(time.Duration(common.RaceConditionDelay) * time.Millisecond)
+	// Check if connection is closing
+	if info.State != common.ConnectionStateActive {
+		c.logger.Printf("Connection %s is closing, rejecting data", versionedID.String())
+		return
+	}
 
-		// Check again
-		c.connMutex.RLock()
-		localConn, exists = c.connections[connID]
-		c.connMutex.RUnlock()
-
-		if !exists {
-			c.logger.Printf("Local connection %s still not found after delay, closing", connID)
-			c.sendCloseMessage(connID, forwardID)
-			return
-		} else {
-			c.logger.Printf("Local connection %s found after delay, continuing", connID)
-		}
+	// Check if versions match
+	if info.VersionedID.Version != versionedID.Version {
+		c.logger.Printf("Version mismatch for connection %s (have %d, received %d), rejecting data",
+			baseID, info.VersionedID.Version, versionedID.Version)
+		c.sendCloseMessage(versionedID, forwardID)
+		return
 	}
 
 	// Write data to local connection
 	_, err = localConn.conn.Write(data)
 	if err != nil {
-		c.logger.Printf("Error writing to local connection %s: %v", connID, err)
+		c.logger.Printf("Error writing to local connection %s: %v", versionedID.String(), err)
 		localConn.conn.Close()
 
 		c.connMutex.Lock()
-		delete(c.connections, connID)
+		// Mark for removal with grace period
+		info.MarkForRemoval()
 		c.connMutex.Unlock()
 
-		c.sendCloseMessage(connID, forwardID)
+		c.sendCloseMessage(versionedID, forwardID)
 	}
 }
 
@@ -582,24 +673,33 @@ func (c *Client) handleCloseMessage(payload []byte) {
 		c.logger.Printf("Error reading conn ID: %v", err)
 		return
 	}
-	connID := string(connIDBytes)
+	connIDStr := string(connIDBytes)
 
-	c.logger.Printf("Received close for connection %s", connID)
+	// Parse versioned connection ID
+	versionedID := common.ParseVersionedID(connIDStr)
+	baseID := versionedID.BaseID
+
+	c.logger.Printf("Received close for connection %s", versionedID.String())
 
 	// Find and close local connection
-	c.connMutex.RLock()
-	localConn, exists := c.connections[connID]
-	c.connMutex.RUnlock()
+	c.connMutex.Lock()
+	localConn, exists := c.connections[baseID]
+	info, infoExists := c.connInfo[baseID]
 
-	if exists {
-		localConn.conn.Close()
+	if exists && infoExists {
+		// Only close if versions match
+		if info.VersionedID.Version == versionedID.Version {
+			localConn.conn.Close()
 
-		c.connMutex.Lock()
-		delete(c.connections, connID)
-		c.connMutex.Unlock()
-
-		c.logger.Printf("Closed local connection %s", connID)
+			// Mark for removal with grace period
+			info.MarkForRemoval()
+			c.logger.Printf("Closed local connection %s", versionedID.String())
+		} else {
+			c.logger.Printf("Version mismatch on close for connection %s (have %d, received %d)",
+				baseID, info.VersionedID.Version, versionedID.Version)
+		}
 	}
+	c.connMutex.Unlock()
 }
 
 // handlePingMessage processes a ping message from the server
@@ -617,42 +717,86 @@ func (c *Client) handlePingMessage() {
 }
 
 // handleNewConnection handles a new connection request from the server
-func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
-	c.logger.Printf("New connection request: %s to %s", connID, destAddr)
+func (c *Client) handleNewConnection(versionedID *common.VersionedID, baseID, forwardID, destAddr string) {
+	c.logger.Printf("Processing new connection request: %s to %s", versionedID.String(), destAddr)
+
+	// Check if connection with this base ID already exists
+	c.connMutex.RLock()
+	existingInfo, exists := c.connInfo[baseID]
+	c.connMutex.RUnlock()
+
+	if exists {
+		// If connection exists but is marked for closing, let it be removed
+		if existingInfo.State == common.ConnectionStateClosing {
+			c.logger.Printf("Connection %s exists but is closing, waiting for cleanup before creating new one", baseID)
+
+			// Wait for the connection to be fully removed
+			waitStart := time.Now()
+			maxWait := time.Duration(common.DefaultConnectionGracePeriod) * time.Millisecond
+
+			for time.Since(waitStart) < maxWait {
+				time.Sleep(50 * time.Millisecond)
+
+				c.connMutex.RLock()
+				_, stillExists := c.connInfo[baseID]
+				c.connMutex.RUnlock()
+
+				if !stillExists {
+					break
+				}
+			}
+
+			// Check again if it's gone
+			c.connMutex.RLock()
+			_, stillExists := c.connInfo[baseID]
+			c.connMutex.RUnlock()
+
+			if stillExists {
+				c.logger.Printf("Connection %s not cleaned up in time, rejecting new connection", baseID)
+				c.sendCloseMessage(versionedID, forwardID)
+				return
+			}
+		} else {
+			// If connection exists and is active, compare versions
+			if existingInfo.VersionedID.Version >= versionedID.Version {
+				c.logger.Printf("Ignoring new connection with older or same version: %s (existing: %d, new: %d)",
+					baseID, existingInfo.VersionedID.Version, versionedID.Version)
+				return
+			}
+
+			// Higher version - close existing connection
+			c.logger.Printf("Replacing connection %s with newer version %d -> %d",
+				baseID, existingInfo.VersionedID.Version, versionedID.Version)
+
+			c.connMutex.RLock()
+			if localConn, exists := c.connections[baseID]; exists {
+				localConn.conn.Close()
+			}
+			c.connMutex.RUnlock()
+
+			c.connMutex.Lock()
+			existingInfo.MarkForRemoval()
+			c.connMutex.Unlock()
+		}
+	}
 
 	// Detect if this is likely HTTP traffic
 	isHTTP := common.IsHTTPTraffic(destAddr)
 	if isHTTP {
-		c.logger.Printf("HTTP traffic detected for connection %s", connID)
+		c.logger.Printf("HTTP traffic detected for connection %s", versionedID.String())
 	}
 
 	// Connect to local service
 	localConn, err := net.Dial("tcp", destAddr)
 	if err != nil {
 		c.logger.Printf("Error connecting to local service %s: %v", destAddr, err)
-		c.sendCloseMessage(connID, forwardID)
+		c.sendCloseMessage(versionedID, forwardID)
 		return
 	}
 
-	c.logger.Printf("Connected to local service %s for connection %s", destAddr, connID)
+	c.logger.Printf("Connected to local service %s for connection %s", destAddr, versionedID.String())
 
-	// Create local connection
-	conn := &LocalConnection{
-		ID:              connID,
-		conn:            localConn,
-		client:          c,
-		destinationAddr: destAddr,
-		forwardID:       forwardID,
-		lastActivity:    time.Now(),
-		isHTTP:          isHTTP,
-	}
-
-	// Register the connection
-	c.connMutex.Lock()
-	c.connections[connID] = conn
-	c.connMutex.Unlock()
-
-	// Choose buffer and timeout based on HTTP detection
+	// Choose buffer size and timeout based on HTTP detection
 	var buffer []byte
 	var idleTimeout time.Duration
 
@@ -661,36 +805,51 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 		buffer = make([]byte, c.config.BufferSizeHTTP) // Larger buffer for HTTP
 		idleTimeout = time.Duration(c.config.IdleTimeoutHTTP) * time.Second
 	} else {
+		// Get buffer from pool
 		buffer = c.bufferPool.Get().([]byte)
-		defer func() {
-			// Only return buffer to pool if it's not an HTTP connection
-			if !isHTTP {
-				c.bufferPool.Put(buffer)
-			}
-		}()
 		idleTimeout = time.Duration(c.config.IdleTimeout) * time.Second
 	}
+
+	// Create local connection
+	conn := &LocalConnection{
+		ID:              baseID,
+		conn:            localConn,
+		client:          c,
+		destinationAddr: destAddr,
+		forwardID:       forwardID,
+		buffer:          buffer,
+	}
+
+	// Create connection info
+	info := common.NewConnectionInfo(baseID, isHTTP)
+	info.VersionedID = versionedID // Use the server-provided version
+
+	// Register the connection
+	c.connMutex.Lock()
+	c.connections[baseID] = conn
+	c.connInfo[baseID] = info
+	c.connMutex.Unlock()
 
 	// Set initial read deadline
 	localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 
 	// Read data from the local connection and forward it to the server
 	for {
-		n, err := localConn.Read(buffer)
+		n, err := localConn.Read(conn.buffer)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Just a timeout, reset deadline and continue for HTTP connections
 				if isHTTP {
-					c.logger.Printf("HTTP connection %s idle, extending timeout", connID)
+					c.logger.Printf("HTTP connection %s idle, extending timeout", versionedID.String())
 					localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 					continue
 				}
 			}
 
 			if err != io.EOF {
-				c.logger.Printf("Error reading from local connection %s: %v", connID, err)
+				c.logger.Printf("Error reading from local connection %s: %v", versionedID.String(), err)
 			} else {
-				c.logger.Printf("Local connection %s closed by local service", connID)
+				c.logger.Printf("Local connection %s closed by local service", versionedID.String())
 			}
 			break
 		}
@@ -698,11 +857,16 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 		// Reset deadline after successful read
 		localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 
-		conn.lastActivity = time.Now()
+		// Update last activity
+		c.connMutex.Lock()
+		if info, exists := c.connInfo[baseID]; exists {
+			info.LastActivity = time.Now()
+		}
+		c.connMutex.Unlock()
 
 		// Send data to server
-		dataMsg := common.CreateDataMessage(connID, forwardID, buffer[:n])
-		
+		dataMsg := common.CreateDataMessage(versionedID, forwardID, conn.buffer[:n])
+
 		c.writeMutex.Lock()
 		err = c.conn.WriteMessage(websocket.BinaryMessage, dataMsg)
 		c.writeMutex.Unlock()
@@ -715,25 +879,29 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 
 	// Clean up
 	localConn.Close()
+
 	c.connMutex.Lock()
-	delete(c.connections, connID)
+	// Mark for removal with grace period
+	if info, exists := c.connInfo[baseID]; exists {
+		info.MarkForRemoval()
+	}
 	c.connMutex.Unlock()
 
-	c.logger.Printf("Local connection %s closed and cleaned up", connID)
+	c.logger.Printf("Local connection %s marked for removal", versionedID.String())
 
 	// For HTTP connections, delay the close message to allow time for any in-flight data
 	if isHTTP {
-		c.logger.Printf("HTTP connection %s - delaying close message by 100ms", connID)
+		c.logger.Printf("HTTP connection %s - delaying close message by 100ms", versionedID.String())
 		time.Sleep(time.Duration(common.HTTPCloseDelay) * time.Millisecond)
 	}
 
 	// Notify server that connection is closed
-	c.sendCloseMessage(connID, forwardID)
+	c.sendCloseMessage(versionedID, forwardID)
 }
 
 // sendCloseMessage sends a close message to the server
-func (c *Client) sendCloseMessage(connID, forwardID string) {
-	c.logger.Printf("Sending close message for connection %s", connID)
+func (c *Client) sendCloseMessage(connID *common.VersionedID, forwardID string) {
+	c.logger.Printf("Sending close message for connection %s", connID.String())
 
 	closeMsg := common.CreateCloseMessage(connID, forwardID)
 

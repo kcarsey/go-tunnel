@@ -3,13 +3,15 @@ package common
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
-	"math/rand"
+	"math/big"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -36,14 +38,29 @@ const (
 	DefaultMaxReconnectAttempts = 10
 	DefaultReconnectDelay       = 5
 
-	// Race condition mitigation delay in milliseconds
-	RaceConditionDelay = 50
+	// Grace period for connection cleanup (milliseconds)
+	// Set to accommodate high-latency environments (75-200ms)
+	DefaultConnectionGracePeriod = 500
 
 	// Connection close delay for HTTP in milliseconds
 	HTTPCloseDelay = 100
 
 	// Nonce length for authentication
 	DefaultNonceLength = 16
+)
+
+// ConnectionState represents the state of a tunneled connection
+type ConnectionState int
+
+const (
+	// ConnectionStateActive indicates the connection is active and ready for data
+	ConnectionStateActive ConnectionState = iota
+
+	// ConnectionStateClosing indicates the connection is in the process of closing
+	ConnectionStateClosing
+
+	// ConnectionStateClosed indicates the connection is closed and can be removed
+	ConnectionStateClosed
 )
 
 // Message types for binary protocol
@@ -56,6 +73,44 @@ const (
 	MessageTypePing         byte = 6
 	MessageTypePong         byte = 7
 )
+
+// Global connection version counter
+var globalVersionCounter uint64 = 0
+
+// GetNextVersion returns the next global connection version number
+func GetNextVersion() uint64 {
+	return atomic.AddUint64(&globalVersionCounter, 1)
+}
+
+// VersionedID represents a connection ID with a version to prevent race conditions
+type VersionedID struct {
+	BaseID  string
+	Version uint64
+}
+
+// String returns the string representation of the versioned ID
+func (vid *VersionedID) String() string {
+	return fmt.Sprintf("%s:v%d", vid.BaseID, vid.Version)
+}
+
+// ParseVersionedID parses a string into a VersionedID
+func ParseVersionedID(idStr string) *VersionedID {
+	parts := strings.Split(idStr, ":v")
+	if len(parts) != 2 {
+		// If no version is found, treat it as version 0
+		return &VersionedID{
+			BaseID:  idStr,
+			Version: 0,
+		}
+	}
+
+	var version uint64
+	fmt.Sscanf(parts[1], "%d", &version)
+	return &VersionedID{
+		BaseID:  parts[0],
+		Version: version,
+	}
+}
 
 // AuthResponse structure for parsing server response
 type AuthResponse struct {
@@ -120,13 +175,25 @@ func (nc *NonceCache) cleanExpired() {
 	nc.lastClean = now
 }
 
-// Generate a random nonce string
+// Generate a cryptographically secure random nonce string
 func GenerateNonce(length int) string {
 	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	charsetLength := big.NewInt(int64(len(charset)))
 
 	b := make([]byte, length)
 	for i := range b {
-		b[i] = charset[rand.Intn(len(charset))]
+		// Generate a random number and use it to select a character from the charset
+		n, err := rand.Int(rand.Reader, charsetLength)
+		if err != nil {
+			// In case of error, use a fallback that's still better than math/rand
+			// This shouldn't happen in practice, but it's safer than panicking
+			h := sha256.New()
+			h.Write([]byte(fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)))
+			digest := h.Sum(nil)
+			b[i] = charset[int(digest[0])%len(charset)]
+		} else {
+			b[i] = charset[n.Int64()]
+		}
 	}
 	return string(b)
 }
@@ -280,9 +347,11 @@ func SerializeAuthResponse(resp AuthResponse) []byte {
 }
 
 // CreateNewConnMessage creates a message for a new connection request
-func CreateNewConnMessage(connID, forwardID, destAddr string) []byte {
+// Now includes version information in the connection ID
+func CreateNewConnMessage(connID *VersionedID, forwardID, destAddr string) []byte {
 	// Format: [type][conn ID len][conn ID][forward ID len][forward ID][dest addr len][dest addr]
-	connIDBytes := []byte(connID)
+	connIDString := connID.String()
+	connIDBytes := []byte(connIDString)
 	forwardIDBytes := []byte(forwardID)
 	destAddrBytes := []byte(destAddr)
 
@@ -301,9 +370,11 @@ func CreateNewConnMessage(connID, forwardID, destAddr string) []byte {
 }
 
 // CreateDataMessage creates a data message
-func CreateDataMessage(connID, forwardID string, data []byte) []byte {
+// Uses versioned connection ID
+func CreateDataMessage(connID *VersionedID, forwardID string, data []byte) []byte {
 	// Format: [type][conn ID len][conn ID][forward ID len][forward ID][data len][data]
-	connIDBytes := []byte(connID)
+	connIDString := connID.String()
+	connIDBytes := []byte(connIDString)
 	forwardIDBytes := []byte(forwardID)
 
 	dataSize := 1 + 4 + len(connIDBytes) + 4 + len(forwardIDBytes) + 4 + len(data)
@@ -321,9 +392,11 @@ func CreateDataMessage(connID, forwardID string, data []byte) []byte {
 }
 
 // CreateCloseMessage creates a close message
-func CreateCloseMessage(connID, forwardID string) []byte {
+// Uses versioned connection ID
+func CreateCloseMessage(connID *VersionedID, forwardID string) []byte {
 	// Format: [type][conn ID len][conn ID][forward ID len][forward ID]
-	connIDBytes := []byte(connID)
+	connIDString := connID.String()
+	connIDBytes := []byte(connIDString)
 	forwardIDBytes := []byte(forwardID)
 
 	buf := bytes.NewBuffer(make([]byte, 0, 1+4+len(connIDBytes)+4+len(forwardIDBytes)))
@@ -393,4 +466,34 @@ func HandleError(err error, msg string) (string, bool) {
 		return errMsg, true
 	}
 	return "", false
+}
+
+// ConnectionInfo represents metadata about a connection
+type ConnectionInfo struct {
+	VersionedID  *VersionedID
+	State        ConnectionState
+	LastActivity time.Time
+	GracePeriod  time.Time // When the connection can be fully removed
+	IsHTTP       bool
+}
+
+// NewConnectionInfo creates a new connection info struct
+func NewConnectionInfo(baseID string, isHTTP bool) *ConnectionInfo {
+	return &ConnectionInfo{
+		VersionedID:  &VersionedID{BaseID: baseID, Version: GetNextVersion()},
+		State:        ConnectionStateActive,
+		LastActivity: time.Now(),
+		IsHTTP:       isHTTP,
+	}
+}
+
+// MarkForRemoval marks a connection for removal after the grace period
+func (ci *ConnectionInfo) MarkForRemoval() {
+	ci.State = ConnectionStateClosing
+	ci.GracePeriod = time.Now().Add(time.Duration(DefaultConnectionGracePeriod) * time.Millisecond)
+}
+
+// ShouldBeRemoved returns true if the connection should be fully removed
+func (ci *ConnectionInfo) ShouldBeRemoved() bool {
+	return ci.State == ConnectionStateClosing && time.Now().After(ci.GracePeriod)
 }

@@ -2,7 +2,7 @@
 clientID: "web-server"
 
 # Server address
-serverAddress: "1.2.3.4:8443"
+serverAddress: "127.0.0.1:8443"
 
 # Access key for authentication
 accessKey: "secret-key-1"
