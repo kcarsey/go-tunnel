@@ -1,0 +1,37 @@
+# Server control address to listen on
+controlAddress: "0.0.0.0:8443"
+
+# TLS configuration (comment out for development without TLS)
+certFile: "/path/to/cert.pem"
+keyFile: "/path/to/key.pem"
+
+# List of authorized client keys (clientID -> accessKey)
+authorizedKeys:
+  web-server: "secret-key-1"
+  app-server: "secret-key-2"
+  db-server: "secret-key-3"
+
+# Authentication timeout in seconds (default: 300 = 5 minutes)
+authTimeout: 300
+
+# Forwarding configuration
+forwards:
+  - name: "ssh"
+    listenAddress: "0.0.0.0:2222"
+    targetClient: "web-server"
+    destinationAddress: "127.0.0.1:22"
+  
+  - name: "http"
+    listenAddress: "0.0.0.0:8080"
+    targetClient: "web-server"
+    destinationAddress: "127.0.0.1:80"
+  
+  - name: "https"
+    listenAddress: "0.0.0.0:8443"
+    targetClient: "web-server"
+    destinationAddress: "127.0.0.1:443"
+    
+  - name: "mysql"
+    listenAddress: "0.0.0.0:3306"
+    targetClient: "db-server"
+    destinationAddress: "127.0.0.1:3306"
