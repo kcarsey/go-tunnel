@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -94,6 +95,7 @@ type LocalConnection struct {
 	destinationAddr string
 	forwardID       string
 	lastActivity    time.Time
+	isHTTP          bool
 }
 
 // Initialize random number generator for nonce creation
@@ -592,15 +594,31 @@ func (c *Client) handleMessages(done chan struct{}) {
 				continue
 			}
 
-			// Find local connection
+			// Find local connection with race condition handling
 			c.connMutex.RLock()
 			localConn, exists := c.connections[connID]
 			c.connMutex.RUnlock()
 
 			if !exists {
-				log.Printf("Local connection %s not found, closing", connID)
-				c.sendCloseMessage(connID, string(forwardIDBytes))
-				continue
+				// Check if this is a race condition with a connection that's being established
+				// Add a small delay before closing to give handleNewConnection time to establish
+				log.Printf("Local connection %s not found, waiting briefly before closing", connID)
+
+				// Wait a short time (50ms) to see if connection gets established
+				time.Sleep(50 * time.Millisecond)
+
+				// Check again
+				c.connMutex.RLock()
+				localConn, exists = c.connections[connID]
+				c.connMutex.RUnlock()
+
+				if !exists {
+					log.Printf("Local connection %s still not found after delay, closing", connID)
+					c.sendCloseMessage(connID, string(forwardIDBytes))
+					continue
+				} else {
+					log.Printf("Local connection %s found after delay, continuing", connID)
+				}
 			}
 
 			// Write data to local connection
@@ -677,6 +695,14 @@ func (c *Client) handleMessages(done chan struct{}) {
 func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 	log.Printf("New connection request: %s to %s", connID, destAddr)
 
+	// Detect if this is likely HTTP traffic based on the destination port
+	isHTTP := false
+	if strings.HasSuffix(destAddr, ":80") || strings.HasSuffix(destAddr, ":443") ||
+		strings.HasSuffix(destAddr, ":8080") || strings.HasSuffix(destAddr, ":8123") {
+		isHTTP = true
+		log.Printf("HTTP traffic detected for connection %s", connID)
+	}
+
 	// Connect to local service
 	localConn, err := net.Dial("tcp", destAddr)
 	if err != nil {
@@ -695,6 +721,7 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 		destinationAddr: destAddr,
 		forwardID:       forwardID,
 		lastActivity:    time.Now(),
+		isHTTP:          isHTTP,
 	}
 
 	// Register the connection
@@ -702,13 +729,41 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 	c.connections[connID] = conn
 	c.connMutex.Unlock()
 
-	// Read data from the local connection and forward it to the server
-	buffer := c.bufferPool.Get().([]byte)
-	defer c.bufferPool.Put(buffer)
+	// Choose buffer and timeout based on HTTP detection
+	var buffer []byte
+	var idleTimeout time.Duration
 
+	// If HTTP, use larger buffer and longer idle timeout
+	if isHTTP {
+		buffer = make([]byte, 64*1024) // Larger buffer for HTTP
+		idleTimeout = 15 * time.Second
+	} else {
+		buffer = c.bufferPool.Get().([]byte)
+		defer func() {
+			// Only return buffer to pool if it's not an HTTP connection
+			if !isHTTP {
+				c.bufferPool.Put(buffer)
+			}
+		}()
+		idleTimeout = 5 * time.Second
+	}
+
+	// Set initial read deadline
+	localConn.SetReadDeadline(time.Now().Add(idleTimeout))
+
+	// Read data from the local connection and forward it to the server
 	for {
 		n, err := localConn.Read(buffer)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Just a timeout, reset deadline and continue for HTTP connections
+				if isHTTP {
+					log.Printf("HTTP connection %s idle, extending timeout", connID)
+					localConn.SetReadDeadline(time.Now().Add(idleTimeout))
+					continue
+				}
+			}
+
 			if err != io.EOF {
 				log.Printf("Error reading from local connection %s: %v", connID, err)
 			} else {
@@ -716,6 +771,9 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 			}
 			break
 		}
+
+		// Reset deadline after successful read
+		localConn.SetReadDeadline(time.Now().Add(idleTimeout))
 
 		conn.lastActivity = time.Now()
 
@@ -752,6 +810,12 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 	c.connMutex.Unlock()
 
 	log.Printf("Local connection %s closed and cleaned up", connID)
+
+	// For HTTP connections, delay the close message to allow time for any in-flight data
+	if isHTTP {
+		log.Printf("HTTP connection %s - delaying close message by 100ms", connID)
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// Notify server that connection is closed
 	c.sendCloseMessage(connID, forwardID)
@@ -830,7 +894,7 @@ func (c *Client) startHeartbeat(done chan struct{}) {
 }
 
 func main() {
-	configFile := flag.String("config", "config.yaml", "Path to config file")
+	configFile := flag.String("config", "client.yaml", "Path to config file")
 	flag.Parse()
 
 	client, err := NewClient(*configFile)

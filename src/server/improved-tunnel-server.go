@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -57,6 +58,9 @@ type ForwardConfig struct {
 
 	// Destination service on the client side
 	DestinationAddress string `yaml:"destinationAddress"`
+
+	// Type of traffic (http, tcp)
+	TrafficType string `yaml:"trafficType,omitempty"`
 }
 
 // Message types for binary protocol
@@ -114,6 +118,7 @@ type Forward struct {
 	server     *Server
 	connCount  int
 	countMutex sync.Mutex
+	isHTTP     bool
 }
 
 // ForwardedConn represents a forwarded connection
@@ -124,6 +129,7 @@ type ForwardedConn struct {
 	forwardName  string
 	forwardID    string
 	lastActivity time.Time
+	isHTTP       bool
 }
 
 // NewServer creates a new tunnel server
@@ -199,10 +205,22 @@ func (s *Server) startForward(config ForwardConfig) error {
 		return fmt.Errorf("failed to start listener for %s on %s: %w", config.Name, config.ListenAddress, err)
 	}
 
+	// Detect if this is HTTP traffic
+	isHTTP := false
+	if config.TrafficType == "http" ||
+		strings.HasSuffix(config.ListenAddress, ":80") ||
+		strings.HasSuffix(config.ListenAddress, ":443") ||
+		strings.HasSuffix(config.ListenAddress, ":8080") ||
+		strings.HasSuffix(config.ListenAddress, ":8123") {
+		isHTTP = true
+		log.Printf("HTTP traffic detected for forward %s", config.Name)
+	}
+
 	forward := &Forward{
 		config:   config,
 		listener: listener,
 		server:   s,
+		isHTTP:   isHTTP,
 	}
 
 	s.forwardsMutex.Lock()
@@ -265,6 +283,7 @@ func (f *Forward) handleConnection(conn net.Conn) {
 		forwardName:  f.config.Name,
 		forwardID:    f.config.Name,
 		lastActivity: time.Now(),
+		isHTTP:       f.isHTTP,
 	}
 
 	// Register the connection with the client
@@ -305,13 +324,35 @@ func (f *Forward) handleConnection(conn net.Conn) {
 
 	log.Printf("Sent new connection notification to client %s for connection %s", client.ID, connID)
 
-	// Read data from the connection and forward it to the client
-	buffer := f.server.bufferPool.Get().([]byte)
-	defer f.server.bufferPool.Put(buffer)
+	// Choose buffer based on connection type
+	var buffer []byte
+	var idleTimeout time.Duration
 
+	if f.isHTTP {
+		buffer = make([]byte, 64*1024) // Larger buffer for HTTP
+		idleTimeout = 30 * time.Second
+	} else {
+		buffer = f.server.bufferPool.Get().([]byte)
+		defer f.server.bufferPool.Put(buffer)
+		idleTimeout = 5 * time.Second
+	}
+
+	// Set initial timeout
+	conn.SetReadDeadline(time.Now().Add(idleTimeout))
+
+	// Read data from the connection and forward it to the client
 	for {
 		n, err := conn.Read(buffer)
 		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// Just a timeout, reset deadline and continue for HTTP connections
+				if f.isHTTP {
+					log.Printf("HTTP connection %s idle, extending timeout", connID)
+					conn.SetReadDeadline(time.Now().Add(idleTimeout))
+					continue
+				}
+			}
+
 			if err != io.EOF {
 				log.Printf("Error reading from connection %s: %v", connID, err)
 			} else {
@@ -319,6 +360,9 @@ func (f *Forward) handleConnection(conn net.Conn) {
 			}
 			break
 		}
+
+		// Reset deadline after successful read
+		conn.SetReadDeadline(time.Now().Add(idleTimeout))
 
 		forwarded.lastActivity = time.Now()
 
@@ -353,6 +397,12 @@ func (f *Forward) handleConnection(conn net.Conn) {
 	client.connMutex.Unlock()
 
 	log.Printf("Connection %s closed and cleaned up", connID)
+
+	// For HTTP connections, delay the close message to allow time for any in-flight data
+	if f.isHTTP {
+		log.Printf("HTTP connection %s - delaying close message by 100ms", connID)
+		time.Sleep(100 * time.Millisecond)
+	}
 
 	// Notify client that connection is closed using binary protocol
 	// Format: [type][conn ID len][conn ID][forward ID len][forward ID]
@@ -712,14 +762,29 @@ func (c *Client) handleMessages(done chan struct{}) {
 				continue
 			}
 
-			// Find connection
+			// Find connection with race condition handling
 			c.connMutex.RLock()
 			conn, exists := c.connTracker[connID]
 			c.connMutex.RUnlock()
 
 			if !exists {
-				log.Printf("Connection %s not found for client %s", connID, c.ID)
-				continue
+				// Check if this is a race condition with a connection that's being closed
+				// Add a small delay before giving up
+				log.Printf("Connection %s not found for client %s, waiting briefly", connID, c.ID)
+
+				time.Sleep(50 * time.Millisecond)
+
+				// Check again
+				c.connMutex.RLock()
+				conn, exists = c.connTracker[connID]
+				c.connMutex.RUnlock()
+
+				if !exists {
+					log.Printf("Connection %s still not found for client %s after delay", connID, c.ID)
+					continue
+				} else {
+					log.Printf("Connection %s found for client %s after delay", connID, c.ID)
+				}
 			}
 
 			// Write data to connection
@@ -774,6 +839,8 @@ func (c *Client) handleMessages(done chan struct{}) {
 			log.Printf("Received ping from client %s", c.ID)
 			// Respond with pong (simple binary message)
 			pongMsg := []byte{MessageTypePong}
+			c.writeMutex.Lock()
+			err := c.conn
 			c.writeMutex.Lock()
 			err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
 			c.writeMutex.Unlock()
@@ -836,7 +903,7 @@ func (c *Client) startHeartbeat(done chan struct{}) {
 }
 
 func main() {
-	configFile := flag.String("config", "config.yaml", "Path to config file")
+	configFile := flag.String("config", "server.yaml", "Path to config file")
 	flag.Parse()
 
 	server, err := NewServer(*configFile)
