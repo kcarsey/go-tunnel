@@ -1,0 +1,20 @@
+# Client ID (unique identifier for this client)
+clientID: "web-server"
+
+# Server address
+serverAddress: "1.2.3.4:8443"
+
+# Access key for authentication
+accessKey: "secret-key-1"
+
+# TLS configuration
+# useTLS: true
+# verifyCert: true
+
+# Optional CA certificate file for custom CA trust
+# caFile: "/path/to/ca.pem"
+
+logLevel: "debug"  # Increase logging detail
+# Ensure reconnect settings are appropriate
+maxReconnectAttempts: 15
+reconnectDelay: 3  # Try more frequent reconnects
