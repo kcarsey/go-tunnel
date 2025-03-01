@@ -840,8 +840,6 @@ func (c *Client) handleMessages(done chan struct{}) {
 			// Respond with pong (simple binary message)
 			pongMsg := []byte{MessageTypePong}
 			c.writeMutex.Lock()
-			err := c.conn
-			c.writeMutex.Lock()
 			err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
 			c.writeMutex.Unlock()
 
