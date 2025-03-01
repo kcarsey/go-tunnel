@@ -50,6 +50,9 @@ type Config struct {
 
 	// Reconnect delay in seconds
 	ReconnectDelay int `yaml:"reconnectDelay"`
+
+	// Log level (debug, info, warning, error)
+	LogLevel string `yaml:"logLevel"`
 }
 
 // Message types for binary protocol (same as server)
@@ -164,11 +167,8 @@ func (c *Client) Start() error {
 				// Connection successful, reset attempt counter
 				attempt = 0
 
-				// Wait for disconnect or done signal
-				select {
-				case <-c.done:
-					return nil
-				}
+				// connect() handles the wait for disconnect
+				// When we return here, it's because we need to reconnect
 			} else {
 				log.Printf("Connection error: %v", err)
 			}
@@ -307,7 +307,7 @@ func (c *Client) connect() error {
 
 	log.Printf("Connecting to %s", u.String())
 
-	// Set up TLS config if needed
+	// Set up dialer with improved configuration
 	var dialer *websocket.Dialer
 	if c.config.UseTLS {
 		tlsConfig := &tls.Config{
@@ -330,30 +330,53 @@ func (c *Client) connect() error {
 		}
 
 		dialer = &websocket.Dialer{
-			TLSClientConfig: tlsConfig,
+			TLSClientConfig:  tlsConfig,
+			ReadBufferSize:   32768,
+			WriteBufferSize:  32768,
+			HandshakeTimeout: 45 * time.Second,
 		}
 	} else {
-		dialer = websocket.DefaultDialer
+		dialer = &websocket.Dialer{
+			ReadBufferSize:   32768,
+			WriteBufferSize:  32768,
+			HandshakeTimeout: 45 * time.Second,
+		}
 	}
 
-	// Connect to server
-	conn, _, err := dialer.Dial(u.String(), nil)
+	// Connect to server with more detailed error reporting
+	conn, resp, err := dialer.Dial(u.String(), nil)
 	if err != nil {
+		if resp != nil {
+			log.Printf("Server returned HTTP %d: %s", resp.StatusCode, resp.Status)
+		}
 		return fmt.Errorf("error connecting to server: %w", err)
 	}
+
+	// Enable keep-alive with pong handler
+	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetPongHandler(func(string) error {
+		log.Printf("Received pong from server")
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
 
 	c.conn = conn
 	c.lastActivity = time.Now()
 
 	// Authenticate using HMAC
+	log.Printf("Connected to server, sending authentication")
 	authMsg := c.createAuthMessage()
 
+	c.writeMutex.Lock()
 	if err := conn.WriteMessage(websocket.BinaryMessage, authMsg); err != nil {
+		c.writeMutex.Unlock()
 		conn.Close()
 		return fmt.Errorf("error sending auth request: %w", err)
 	}
+	c.writeMutex.Unlock()
 
 	// Wait for auth response
+	log.Printf("Authentication sent, waiting for response")
 	_, respBytes, err := conn.ReadMessage()
 	if err != nil {
 		conn.Close()
@@ -371,19 +394,46 @@ func (c *Client) connect() error {
 		return fmt.Errorf("authentication failed: %s", authResp.Message)
 	}
 
-	log.Printf("Connected and authenticated successfully")
+	log.Printf("Connected and authenticated successfully, waiting for server messages")
+
+	// Use a WaitGroup and done channel to coordinate goroutine shutdown
+	clientDone := make(chan struct{})
+	var wg sync.WaitGroup
 
 	// Start message handling
-	go c.handleMessages()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.handleMessages(clientDone)
+	}()
 
 	// Start heartbeat
-	go c.startHeartbeat()
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		c.startHeartbeat(clientDone)
+	}()
 
-	return nil
+	// Wait for disconnection or done signal
+	select {
+	case <-c.done:
+		log.Printf("Client shutting down due to external signal")
+		close(clientDone)
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Client shutting down"))
+		conn.Close()
+	case <-clientDone:
+		log.Printf("Client disconnected due to WebSocket closure")
+	}
+
+	wg.Wait()
+	log.Printf("Client connection fully cleaned up")
+
+	return nil // Return nil to allow reconnection
 }
 
 // handleMessages handles incoming messages from the server
-func (c *Client) handleMessages() {
+func (c *Client) handleMessages(done chan struct{}) {
 	defer func() {
 		if !c.reconnecting {
 			c.conn.Close()
@@ -395,18 +445,37 @@ func (c *Client) handleMessages() {
 			}
 			c.connMutex.Unlock()
 
-			log.Printf("Disconnected from server")
+			log.Printf("Client message handler exited")
+			close(done)
 		}
 	}()
 
 	for {
-		_, msgBytes, err := c.conn.ReadMessage()
+		// Read message using binary protocol
+		msgType, msgBytes, err := c.conn.ReadMessage()
 		if err != nil {
-			if c.reconnecting {
-				return
-			}
 			log.Printf("Error reading message from server: %v", err)
 			return
+		}
+
+		c.lastActivity = time.Now()
+
+		// Handle control messages (ping, pong, close)
+		if msgType == websocket.PingMessage {
+			log.Printf("Received ping from server, responding with pong")
+			c.writeMutex.Lock()
+			c.conn.WriteMessage(websocket.PongMessage, nil)
+			c.writeMutex.Unlock()
+			continue
+		} else if msgType == websocket.PongMessage {
+			log.Printf("Received WebSocket pong from server")
+			continue
+		} else if msgType == websocket.CloseMessage {
+			log.Printf("Received close frame from server")
+			return
+		} else if msgType != websocket.BinaryMessage {
+			log.Printf("Received unexpected WebSocket message type: %d", msgType)
+			continue
 		}
 
 		if len(msgBytes) == 0 {
@@ -414,14 +483,13 @@ func (c *Client) handleMessages() {
 			continue
 		}
 
-		c.lastActivity = time.Now()
-
 		// Handle based on message type
-		msgType := msgBytes[0]
+		msgType = int(msgBytes[0])
 		payload := msgBytes[1:]
 
-		switch msgType {
+		switch msgBytes[0] {
 		case MessageTypeNewConn:
+			log.Printf("Received new connection request")
 			// Parse new connection message
 			// Format: [conn ID len][conn ID][forward ID len][forward ID][dest addr len][dest addr]
 			buf := bytes.NewBuffer(payload)
@@ -470,6 +538,8 @@ func (c *Client) handleMessages() {
 				continue
 			}
 			destAddr := string(destAddrBytes)
+
+			log.Printf("New connection request: %s, forwarding to %s", connID, destAddr)
 
 			// Handle the new connection
 			go c.handleNewConnection(connID, forwardID, destAddr)
@@ -566,7 +636,7 @@ func (c *Client) handleMessages() {
 			}
 			connID := string(connIDBytes)
 
-			// Rest of message not used
+			log.Printf("Received close for connection %s", connID)
 
 			// Find and close local connection
 			c.connMutex.RLock()
@@ -579,16 +649,24 @@ func (c *Client) handleMessages() {
 				c.connMutex.Lock()
 				delete(c.connections, connID)
 				c.connMutex.Unlock()
+
+				log.Printf("Closed local connection %s", connID)
 			}
 
 		case MessageTypePing:
+			log.Printf("Received ping from server")
 			// Respond with pong (simple binary message)
 			pongMsg := []byte{MessageTypePong}
 			c.writeMutex.Lock()
-			c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
+			err := c.conn.WriteMessage(websocket.BinaryMessage, pongMsg)
 			c.writeMutex.Unlock()
 
+			if err != nil {
+				log.Printf("Error sending pong to server: %v", err)
+			}
+
 		case MessageTypePong:
+			log.Printf("Received application-level pong from server")
 			// Just update last activity time
 			// Already done at the start of the message handler
 		}
@@ -606,6 +684,8 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 		c.sendCloseMessage(connID, forwardID)
 		return
 	}
+
+	log.Printf("Connected to local service %s for connection %s", destAddr, connID)
 
 	// Create local connection
 	conn := &LocalConnection{
@@ -631,6 +711,8 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 		if err != nil {
 			if err != io.EOF {
 				log.Printf("Error reading from local connection %s: %v", connID, err)
+			} else {
+				log.Printf("Local connection %s closed by local service", connID)
 			}
 			break
 		}
@@ -669,12 +751,16 @@ func (c *Client) handleNewConnection(connID, forwardID, destAddr string) {
 	delete(c.connections, connID)
 	c.connMutex.Unlock()
 
+	log.Printf("Local connection %s closed and cleaned up", connID)
+
 	// Notify server that connection is closed
 	c.sendCloseMessage(connID, forwardID)
 }
 
 // sendCloseMessage sends a close message to the server
 func (c *Client) sendCloseMessage(connID, forwardID string) {
+	log.Printf("Sending close message for connection %s", connID)
+
 	// Format: [type][conn ID len][conn ID][forward ID len][forward ID]
 	connIDBytes := []byte(connID)
 	forwardIDBytes := []byte(forwardID)
@@ -688,14 +774,20 @@ func (c *Client) sendCloseMessage(connID, forwardID string) {
 	buf.Write(forwardIDBytes)
 
 	c.writeMutex.Lock()
-	c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes()) // Ignore error as server might be gone
+	err := c.conn.WriteMessage(websocket.BinaryMessage, buf.Bytes())
 	c.writeMutex.Unlock()
+
+	if err != nil {
+		log.Printf("Error sending close message to server: %v", err)
+	}
 }
 
 // startHeartbeat starts a heartbeat goroutine for the client
-func (c *Client) startHeartbeat() {
-	ticker := time.NewTicker(30 * time.Second)
+func (c *Client) startHeartbeat(done chan struct{}) {
+	ticker := time.NewTicker(15 * time.Second) // More frequent heartbeats
 	defer ticker.Stop()
+
+	log.Printf("Started heartbeat")
 
 	for {
 		select {
@@ -703,20 +795,23 @@ func (c *Client) startHeartbeat() {
 			// Check if client is done
 			select {
 			case <-c.done:
+				log.Printf("Heartbeat stopped due to client shutdown")
 				return
 			default:
 				// Continue
 			}
 
 			// Check if client is still active
-			if time.Since(c.lastActivity) > 2*time.Minute {
-				log.Printf("Server timed out")
+			if time.Since(c.lastActivity) > 45*time.Second {
+				log.Printf("Server timed out (no activity for >45s)")
 				c.conn.Close()
 				return
 			}
 
 			// Send ping using binary protocol
+			log.Printf("Sending ping to server")
 			pingMsg := []byte{MessageTypePing}
+
 			c.writeMutex.Lock()
 			err := c.conn.WriteMessage(websocket.BinaryMessage, pingMsg)
 			c.writeMutex.Unlock()
@@ -726,6 +821,10 @@ func (c *Client) startHeartbeat() {
 				c.conn.Close()
 				return
 			}
+
+		case <-done:
+			log.Printf("Heartbeat stopped due to WebSocket closure")
+			return
 		}
 	}
 }
