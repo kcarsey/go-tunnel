@@ -671,7 +671,7 @@ func (c *Client) handleMessages(done chan struct{}) {
 
 		// Mark all connections for removal
 		c.connMutex.Lock()
-		for baseID, info := range c.connInfo {
+		for _, info := range c.connInfo {
 			info.MarkForRemoval()
 		}
 		c.connMutex.Unlock()
