@@ -2,14 +2,14 @@
 clientID: "web-server"
 
 # Server address
-serverAddress: "127.0.0.1:8443"
+serverAddress: "3.148.99.188:8443"
 
 # Access key for authentication
 accessKey: "secret-key-1"
 
 # TLS configuration (defaults to true for both)
-useTLS: true
-verifyCert: true
+# useTLS: true
+# verifyCert: true
 
 # Optional CA certificate file for custom CA trust
 # caFile: "/path/to/ca.pem"

@@ -475,6 +475,7 @@ type ConnectionInfo struct {
 	LastActivity time.Time
 	GracePeriod  time.Time // When the connection can be fully removed
 	IsHTTP       bool
+	Ready        bool // Indicates if the connection is ready to receive data
 }
 
 // NewConnectionInfo creates a new connection info struct
@@ -489,8 +490,12 @@ func NewConnectionInfo(baseID string, isHTTP bool) *ConnectionInfo {
 
 // MarkForRemoval marks a connection for removal after the grace period
 func (ci *ConnectionInfo) MarkForRemoval() {
-	ci.State = ConnectionStateClosing
-	ci.GracePeriod = time.Now().Add(time.Duration(DefaultConnectionGracePeriod) * time.Millisecond)
+	// Only proceed if the connection is not already closing
+	if ci.State == ConnectionStateActive {
+		ci.State = ConnectionStateClosing
+		gracePeriod := time.Duration(DefaultConnectionGracePeriod) * time.Millisecond
+		ci.GracePeriod = time.Now().Add(gracePeriod)
+	}
 }
 
 // ShouldBeRemoved returns true if the connection should be fully removed

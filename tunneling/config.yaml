@@ -16,18 +16,18 @@ authTimeout: 300
 
 # Forwarding configuration
 forwards:
-  - name: "ssh"
-    listenAddress: "0.0.0.0:2222"
-    targetClient: "web-server"
-    destinationAddress: "192.168.1.5:22"
-    # Specify traffic type (http, tcp)
-    trafficType: "tcp"
-  
-  # - name: "http"
-  #   listenAddress: "0.0.0.0:8080"
+  # - name: "ssh"
+  #   listenAddress: "0.0.0.0:2222"
   #   targetClient: "web-server"
-  #   destinationAddress: "127.0.0.1:80"
-  #   trafficType: "http"
+  #   destinationAddress: "192.168.1.5:22"
+  #   # Specify traffic type (http, tcp)
+  #   trafficType: "tcp"
+  
+  - name: "http"
+    listenAddress: "0.0.0.0:8080"
+    targetClient: "web-server"
+    destinationAddress: "127.0.0.1:80"
+    trafficType: "http"
   
   # - name: "https"
   #   listenAddress: "0.0.0.0:8443"
